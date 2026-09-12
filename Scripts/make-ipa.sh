@@ -9,7 +9,18 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-: "${DEVELOPER_DIR:=/Applications/Xcode-16.4.0.app/Contents/Developer}"
+if [ -z "${DEVELOPER_DIR:-}" ]; then
+  if selected="$(xcode-select -p 2>/dev/null)" && [ -d "$selected" ]; then
+    DEVELOPER_DIR="$selected"
+  elif [ -d /Applications/Xcode.app/Contents/Developer ]; then
+    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+  elif [ -d /Applications/Xcode-16.4.0.app/Contents/Developer ]; then
+    DEVELOPER_DIR=/Applications/Xcode-16.4.0.app/Contents/Developer
+  else
+    echo "No Xcode developer directory found. Set DEVELOPER_DIR to Xcode.app/Contents/Developer." >&2
+    exit 1
+  fi
+fi
 export DEVELOPER_DIR
 
 CONFIG="${1:-Release}"
