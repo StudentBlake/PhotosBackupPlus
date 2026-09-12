@@ -134,7 +134,7 @@ Use physical iOS 15 and newer phones without an attached debugger. Simulated tas
 
 Run a multi-day trial that takes new photos without opening the app. Include a stationary phone overnight, arrival-home events, lock/unlock, ordinary system termination, explicit force-quit followed by reopening, reboot/first unlock, Wi-Fi loss, cellular-policy changes, Low Power Mode and Background App Refresh off.
 
-Exercise local photos, iCloud-only originals, large videos, low disk space, expired authorization/upload URLs, server errors, crash after PUT before commit and crash after server commit before local confirmation. Keep the current still-image-only Live Photo scope visible; resource-complete backup is separate work.
+Exercise local photos, iCloud-only originals, large videos, Live Photo pairs (including a kill after the still PUT), low disk space, expired authorization/upload URLs, server errors, crash after PUT before commit and crash after server commit before local confirmation.
 
 Measure discovery latency separately from preparation, transfer and finalization latency. Report actual Google confirmations, missed items, duplicated items and battery impact. Treat periods with no granted execution opportunity distinctly from engine failures. A useful target is recovery without missing or falsely completed items whenever execution becomes available; observed overnight completion is evidence, not an OS guarantee.
 

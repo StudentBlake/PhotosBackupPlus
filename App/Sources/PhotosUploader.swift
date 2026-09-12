@@ -110,8 +110,9 @@ struct PhotosUploader {
                 throw GPMCError(kind: .credentialRejected, message: "No Google account is connected. Connect one and try again.")
             }
             var checkpoint = restoredCheckpoint
-            if let restoredCheckpoint,
-               !FileManager.default.fileExists(atPath: restoredCheckpoint.filePath) {
+            if let restored = restoredCheckpoint,
+               !FileManager.default.fileExists(atPath: restored.filePath)
+                || (restored.companionFilePath.map { !FileManager.default.fileExists(atPath: $0) } ?? false) {
                 checkpoint = nil
                 await emit(.checkpoint(nil))
                 DiagnosticEventLog.shared.record(
@@ -122,12 +123,25 @@ struct PhotosUploader {
             }
             if checkpoint == nil {
                 await emit(.state(.exporting))
-                let media = try await exporter.export(source, allowsNetworkAccess: options.allowsICloudDownload)
-                if media.byteCount >= largeItemThreshold {
+                let media: ExportedMedia
+                do {
+                    media = try await exporter.export(
+                        source,
+                        allowsNetworkAccess: options.allowsICloudDownload,
+                        incompleteLivePhotos: options.incompleteLivePhotos
+                    )
+                } catch MediaExporter.Failure.incompleteLivePhoto {
+                    return .skipped
+                }
+                if media.totalByteCount >= largeItemThreshold {
                     DiagnosticEventLog.shared.record(
                         "upload",
-                        "Prepared a large item (\(DiagnosticProcessInfo.bytes(media.byteCount))) for upload; \(DiagnosticProcessInfo.memoryDescription())"
+                        "Prepared a large item (\(DiagnosticProcessInfo.bytes(media.totalByteCount))) for upload; \(DiagnosticProcessInfo.memoryDescription())"
                     )
+                }
+                if media.isLivePhoto, media.companion == nil, options.incompleteLivePhotos == .skip {
+                    await exporter.discard(media)
+                    return .skipped
                 }
                 checkpoint = UploadCheckpoint(
                     filePath: media.url.standardizedFileURL.path,
@@ -136,9 +150,13 @@ struct PhotosUploader {
                     byteCount: media.byteCount,
                     temporary: media.temporary,
                     prepared: nil,
-                    continuesAfterProcessExit: await client.usesBackgroundFileTransfers
+                    continuesAfterProcessExit: await client.usesBackgroundFileTransfers,
+                    companionFilePath: media.companion?.url.standardizedFileURL.path,
+                    companionFilename: media.companion?.filename,
+                    companionByteCount: media.companion?.byteCount
                 )
-                await emit(.described(name: media.filename, byteCount: media.byteCount))
+                let name = media.companion.map { "\(media.filename) + \($0.filename)" } ?? media.filename
+                await emit(.described(name: name, byteCount: media.totalByteCount))
                 await emit(.checkpoint(checkpoint))
             }
             guard var checkpoint else {
@@ -146,102 +164,17 @@ struct PhotosUploader {
             }
             try Task.checkCancellation()
 
-            if checkpoint.prepared == nil {
-                let preparation = try await client.prepareUpload(
-                    file: checkpoint.fileURL,
-                    filename: checkpoint.filename,
-                    modified: checkpoint.modified
-                ) { phase in
-                    relay.report(phase.itemState)
-                }
-                await relay.flush()
-                switch preparation {
-                case .alreadyBackedUp(let mediaKey):
-                    await exporter.discard(checkpoint.exportedMedia)
-                    await emit(.checkpoint(nil))
-                    return .alreadyBackedUp(mediaKey: mediaKey)
-                case .ready(let prepared):
-                    checkpoint.prepared = prepared
-                    // This write is the hand-off: after it returns, relaunch can
-                    // safely find the body and reattach to the task by `id`.
-                    await emit(.checkpoint(checkpoint))
-                }
-            }
-
-            guard let prepared = checkpoint.prepared else {
-                throw GPMCError(message: "Could not prepare the upload.")
-            }
-            let completed: PreparedUpload
-            do {
-                completed = try await client.transfer(prepared, file: checkpoint.fileURL, transferID: id,
-                                                      foreground: checkpoint.continuesAfterProcessExit == false) { phase in
-                    relay.report(phase.itemState)
-                }
-                await relay.flush()
-            } catch {
-                await client.forgetTransfer(id)
-                // A failed upload URL may no longer be reusable. Keep the
-                // expensive staged body, but obtain a fresh upload ID on retry.
-                checkpoint.prepared = nil
-                if (error as? GPMCError)?.kind == .invalidUploadReceipt {
-                    // Persist the fallback so a relaunch does not send the
-                    // retry through the same background transport again.
-                    checkpoint.continuesAfterProcessExit = false
-                    checkpoint.retriedAfterInvalidReceipt = true
-                    DiagnosticEventLog.shared.record(
-                        "upload",
-                        "Google returned an unusable upload receipt; this item will retry as a foreground upload, which only runs while the app is open",
-                        level: .warning
-                    )
-                }
-                await emit(.checkpoint(checkpoint))
-                throw error
-            }
-            checkpoint.prepared = completed
-            await emit(.checkpoint(checkpoint))
-
-            let outcome: UploadOutcome
-            do {
-                // Read from `options`, not from `completed`: a checkpoint
-                // restored from an earlier session predates any toggle the user
-                // has flipped since, and the committed policy has to be the
-                // current one.
-                outcome = try await client.commit(completed,
-                                                  useQuota: options.useQuota,
-                                                  saver: options.storageSaver) { phase in
-                    relay.report(phase.itemState)
-                }
-            } catch let error as GPMCError where error.kind == .invalidUploadReceipt {
-                await client.forgetTransfer(id)
-                checkpoint.prepared = nil
-                checkpoint.continuesAfterProcessExit = false
-                // One recovery per item. Google rejects the commit arguments
-                // for more than a stale upload token, and a rejection that
-                // survives a fresh preflight and transfer is one of those —
-                // re-uploading the bytes again would not fix it either.
-                guard checkpoint.retriedAfterInvalidReceipt != true else {
-                    await emit(.checkpoint(checkpoint))
-                    DiagnosticEventLog.shared.record(
-                        "upload",
-                        "Google rejected an upload's finalization again after a fresh transfer, so the item was not retried further",
-                        level: .error
-                    )
-                    throw GPMCError(kind: .malformed, message: error.message, status: error.status)
-                }
-                DiagnosticEventLog.shared.record(
-                    "upload",
-                    "Google rejected an upload's receipt at finalization; transferring the item again while the app is open",
-                    level: .warning
+            if checkpoint.isLivePhoto {
+                return try await Self.uploadLivePhoto(
+                    id: id, checkpoint: &checkpoint, client: client, exporter: exporter,
+                    options: options, relay: relay, emit: emit
                 )
-                checkpoint.retriedAfterInvalidReceipt = true
-                await emit(.checkpoint(checkpoint))
-                throw error
             }
-            await relay.flush()
-            await client.forgetTransfer(id)
-            await exporter.discard(checkpoint.exportedMedia)
-            await emit(.checkpoint(nil))
-            return outcome
+
+            return try await Self.uploadSingle(
+                id: id, checkpoint: &checkpoint, client: client, exporter: exporter,
+                options: options, relay: relay, emit: emit
+            )
         }
     }
 
@@ -249,9 +182,287 @@ struct PhotosUploader {
         let exporter = self.exporter
         let client = self.client
         return { id, checkpoint in
-            if let client = await client() { await client.cancelTransfer(id) }
-            else { await BackgroundFileUploadTransport.shared.cancel(transferID: id) }
+            if let client = await client() {
+                await client.cancelTransfer(id)
+                if let companionID = checkpoint.companionTransferID {
+                    await client.cancelTransfer(companionID)
+                }
+            } else {
+                await BackgroundFileUploadTransport.shared.cancel(transferID: id)
+                if let companionID = checkpoint.companionTransferID {
+                    await BackgroundFileUploadTransport.shared.cancel(transferID: companionID)
+                }
+            }
             await exporter.discard(checkpoint.exportedMedia)
+        }
+    }
+
+    private static func uploadSingle(
+        id: UUID, checkpoint: inout UploadCheckpoint, client: GPMCClient, exporter: MediaExporter,
+        options: UploadOptions, relay: UploadPhaseRelay, emit: UploadEventSink
+    ) async throws -> UploadOutcome {
+        if checkpoint.prepared == nil {
+            let preparation = try await client.prepareUpload(
+                file: checkpoint.fileURL,
+                filename: checkpoint.filename,
+                modified: checkpoint.modified
+            ) { phase in
+                relay.report(phase.itemState)
+            }
+            await relay.flush()
+            switch preparation {
+            case .alreadyBackedUp(let mediaKey):
+                await exporter.discard(checkpoint.exportedMedia)
+                await emit(.checkpoint(nil))
+                return .alreadyBackedUp(mediaKey: mediaKey)
+            case .ready(let prepared):
+                checkpoint.prepared = prepared
+                await emit(.checkpoint(checkpoint))
+            }
+        }
+
+        guard let prepared = checkpoint.prepared else {
+            throw GPMCError(message: "Could not prepare the upload.")
+        }
+        let completed: PreparedUpload
+        do {
+            completed = try await client.transfer(prepared, file: checkpoint.fileURL, transferID: id,
+                                                  foreground: checkpoint.continuesAfterProcessExit == false) { phase in
+                relay.report(phase.itemState)
+            }
+            await relay.flush()
+        } catch {
+            await client.forgetTransfer(id)
+            checkpoint.prepared = nil
+            if (error as? GPMCError)?.kind == .invalidUploadReceipt {
+                checkpoint.continuesAfterProcessExit = false
+                checkpoint.retriedAfterInvalidReceipt = true
+                DiagnosticEventLog.shared.record(
+                    "upload",
+                    "Google returned an unusable upload receipt; this item will retry as a foreground upload, which only runs while the app is open",
+                    level: .warning
+                )
+            }
+            await emit(.checkpoint(checkpoint))
+            throw error
+        }
+        checkpoint.prepared = completed
+        await emit(.checkpoint(checkpoint))
+
+        let outcome: UploadOutcome
+        do {
+            outcome = try await client.commit(completed,
+                                              useQuota: options.useQuota,
+                                              saver: options.storageSaver) { phase in
+                relay.report(phase.itemState)
+            }
+        } catch let error as GPMCError where error.kind == .invalidUploadReceipt {
+            await client.forgetTransfer(id)
+            checkpoint.prepared = nil
+            checkpoint.continuesAfterProcessExit = false
+            guard checkpoint.retriedAfterInvalidReceipt != true else {
+                await emit(.checkpoint(checkpoint))
+                DiagnosticEventLog.shared.record(
+                    "upload",
+                    "Google rejected an upload's finalization again after a fresh transfer, so the item was not retried further",
+                    level: .error
+                )
+                throw GPMCError(kind: .malformed, message: error.message, status: error.status)
+            }
+            DiagnosticEventLog.shared.record(
+                "upload",
+                "Google rejected an upload's receipt at finalization; transferring the item again while the app is open",
+                level: .warning
+            )
+            checkpoint.retriedAfterInvalidReceipt = true
+            await emit(.checkpoint(checkpoint))
+            throw error
+        }
+        await relay.flush()
+        await client.forgetTransfer(id)
+        await exporter.discard(checkpoint.exportedMedia)
+        await emit(.checkpoint(nil))
+        return outcome
+    }
+
+    private static func uploadLivePhoto(
+        id: UUID, checkpoint: inout UploadCheckpoint, client: GPMCClient, exporter: MediaExporter,
+        options: UploadOptions, relay: UploadPhaseRelay, emit: UploadEventSink
+    ) async throws -> UploadOutcome {
+        guard let videoPath = checkpoint.companionFilePath,
+              let videoFilename = checkpoint.companionFilename else {
+            if options.incompleteLivePhotos == .skip {
+                await exporter.discard(checkpoint.exportedMedia)
+                await emit(.checkpoint(nil))
+                return .skipped
+            }
+            return try await uploadSingle(
+                id: id, checkpoint: &checkpoint, client: client, exporter: exporter,
+                options: options, relay: relay, emit: emit
+            )
+        }
+        let videoURL = URL(fileURLWithPath: videoPath)
+
+        if checkpoint.liveKind == nil {
+            let preparation = try await client.prepareLivePhoto(
+                photo: checkpoint.fileURL,
+                video: videoURL,
+                photoFilename: checkpoint.filename,
+                videoFilename: videoFilename,
+                modified: checkpoint.modified,
+                updateExisting: options.updateExistingPhotosToLive
+            ) { phase in
+                relay.report(phase.itemState)
+            }
+            await relay.flush()
+            switch preparation {
+            case .alreadyBackedUp(let mediaKey):
+                await exporter.discard(checkpoint.exportedMedia)
+                await emit(.checkpoint(nil))
+                return .alreadyBackedUp(mediaKey: mediaKey)
+            case .skippedRemoteVideo:
+                await exporter.discard(checkpoint.exportedMedia)
+                await emit(.checkpoint(nil))
+                return .skipped
+            case .create(let photo, let video):
+                checkpoint.liveKind = .create
+                checkpoint.prepared = photo
+                checkpoint.companionPrepared = video
+                checkpoint.companionTransferID = UUID()
+                await emit(.checkpoint(checkpoint))
+            case .reconcile(let video, let photoSHA1):
+                checkpoint.liveKind = .reconcile
+                checkpoint.companionPrepared = video
+                checkpoint.companionTransferID = UUID()
+                checkpoint.reconcilePhotoSHA1 = photoSHA1
+                await emit(.checkpoint(checkpoint))
+            }
+        }
+
+        let foreground = checkpoint.continuesAfterProcessExit == false
+        let stillTotal = checkpoint.byteCount
+        let motionTotal = checkpoint.companionByteCount ?? 0
+        let pairTotal = max(1, stillTotal + motionTotal)
+
+        if checkpoint.liveKind == .create, let prepared = checkpoint.prepared, prepared.receipt == nil {
+            do {
+                let completed = try await client.transfer(
+                    prepared, file: checkpoint.fileURL, transferID: id, foreground: foreground
+                ) { phase in
+                    if case .sending(let sent, _) = phase {
+                        relay.report(.uploading(fraction: Double(sent) / Double(pairTotal)))
+                    } else {
+                        relay.report(phase.itemState)
+                    }
+                }
+                await relay.flush()
+                checkpoint.prepared = completed
+                await emit(.checkpoint(checkpoint))
+            } catch {
+                await client.forgetTransfer(id)
+                Self.resetLiveReceipts(&checkpoint, error: error)
+                await emit(.checkpoint(checkpoint))
+                throw error
+            }
+        }
+
+        if let companionID = checkpoint.companionTransferID,
+           let prepared = checkpoint.companionPrepared, prepared.receipt == nil {
+            let stillSent = checkpoint.liveKind == .create ? stillTotal : 0
+            do {
+                let completed = try await client.transfer(
+                    prepared, file: videoURL, transferID: companionID, foreground: foreground
+                ) { phase in
+                    if case .sending(let sent, _) = phase {
+                        relay.report(.uploading(fraction: Double(stillSent + sent) / Double(pairTotal)))
+                    } else {
+                        relay.report(phase.itemState)
+                    }
+                }
+                await relay.flush()
+                checkpoint.companionPrepared = completed
+                await emit(.checkpoint(checkpoint))
+            } catch {
+                await client.forgetTransfer(companionID)
+                Self.resetLiveReceipts(&checkpoint, error: error)
+                await emit(.checkpoint(checkpoint))
+                throw error
+            }
+        }
+
+        let outcome: UploadOutcome
+        do {
+            switch checkpoint.liveKind {
+            case .create:
+                guard let photo = checkpoint.prepared, let video = checkpoint.companionPrepared else {
+                    throw GPMCError(message: "Could not prepare the Live Photo upload.")
+                }
+                outcome = try await client.commitLivePhoto(
+                    photo: photo, video: video, useQuota: options.useQuota, saver: options.storageSaver
+                ) { phase in
+                    relay.report(phase.itemState)
+                }
+            case .reconcile:
+                guard let video = checkpoint.companionPrepared,
+                      let photoSHA1 = checkpoint.reconcilePhotoSHA1 else {
+                    throw GPMCError(message: "Could not prepare the Live Photo update.")
+                }
+                outcome = try await client.reconcileLivePhoto(
+                    video: video, photoSHA1: photoSHA1, useQuota: options.useQuota, saver: options.storageSaver
+                ) { phase in
+                    relay.report(phase.itemState)
+                }
+            case nil:
+                throw GPMCError(message: "Could not prepare the Live Photo upload.")
+            }
+        } catch let error as GPMCError where error.kind == .invalidUploadReceipt {
+            await client.forgetTransfer(id)
+            if let companionID = checkpoint.companionTransferID {
+                await client.forgetTransfer(companionID)
+            }
+            let alreadyRetried = checkpoint.retriedAfterInvalidReceipt == true
+            Self.resetLiveReceipts(&checkpoint, error: error)
+            guard !alreadyRetried else {
+                await emit(.checkpoint(checkpoint))
+                DiagnosticEventLog.shared.record(
+                    "upload",
+                    "Google rejected an upload's finalization again after a fresh transfer, so the item was not retried further",
+                    level: .error
+                )
+                throw GPMCError(kind: .malformed, message: error.message, status: error.status)
+            }
+            DiagnosticEventLog.shared.record(
+                "upload",
+                "Google rejected an upload's receipt at finalization; transferring the item again while the app is open",
+                level: .warning
+            )
+            checkpoint.retriedAfterInvalidReceipt = true
+            await emit(.checkpoint(checkpoint))
+            throw error
+        }
+        await relay.flush()
+        await client.forgetTransfer(id)
+        if let companionID = checkpoint.companionTransferID {
+            await client.forgetTransfer(companionID)
+        }
+        await exporter.discard(checkpoint.exportedMedia)
+        await emit(.checkpoint(nil))
+        return outcome
+    }
+
+    private static func resetLiveReceipts(_ checkpoint: inout UploadCheckpoint, error: Error) {
+        checkpoint.prepared = nil
+        checkpoint.companionPrepared = nil
+        checkpoint.liveKind = nil
+        checkpoint.reconcilePhotoSHA1 = nil
+        if (error as? GPMCError)?.kind == .invalidUploadReceipt {
+            checkpoint.continuesAfterProcessExit = false
+            checkpoint.retriedAfterInvalidReceipt = true
+            DiagnosticEventLog.shared.record(
+                "upload",
+                "Google returned an unusable upload receipt; this item will retry as a foreground upload, which only runs while the app is open",
+                level: .warning
+            )
         }
     }
 }

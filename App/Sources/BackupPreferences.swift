@@ -22,6 +22,21 @@ enum BackupConnection: String, CaseIterable, Identifiable {
     }
 }
 
+/// What to do when a Live Photo has no motion resource in PhotoKit.
+enum IncompleteLivePhotosPolicy: String, CaseIterable, Identifiable, Equatable, Sendable {
+    case uploadStill
+    case skip
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .uploadStill: return "Upload Still"
+        case .skip: return "Skip"
+        }
+    }
+}
+
 @MainActor
 final class BackupPreferences: ObservableObject {
     private enum Key {
@@ -32,6 +47,8 @@ final class BackupPreferences: ObservableObject {
         static let concurrentUploads = "backup.concurrentUploads"
         static let storageSaver = "backup.storageSaver"
         static let useQuota = "backup.useQuota"
+        static let updateExistingPhotosToLive = "backup.updateExistingPhotosToLive"
+        static let incompleteLivePhotos = "backup.incompleteLivePhotos"
     }
 
     @Published var selectedAlbumIDs: Set<String> { didSet { saveAlbumIDs() } }
@@ -41,6 +58,10 @@ final class BackupPreferences: ObservableObject {
     @Published var concurrentUploads: Int { didSet { defaults.set(concurrentUploads, forKey: Key.concurrentUploads) } }
     @Published var storageSaver: Bool { didSet { defaults.set(storageSaver, forKey: Key.storageSaver) } }
     @Published var useQuota: Bool { didSet { defaults.set(useQuota, forKey: Key.useQuota) } }
+    @Published var updateExistingPhotosToLive: Bool { didSet { defaults.set(updateExistingPhotosToLive, forKey: Key.updateExistingPhotosToLive) } }
+    @Published var incompleteLivePhotos: IncompleteLivePhotosPolicy {
+        didSet { defaults.set(incompleteLivePhotos.rawValue, forKey: Key.incompleteLivePhotos) }
+    }
 
     private let defaults: UserDefaults
 
@@ -56,6 +77,10 @@ final class BackupPreferences: ObservableObject {
             defaults.object(forKey: Key.concurrentUploads) as? Int ?? 2)
         storageSaver = defaults.bool(forKey: Key.storageSaver)
         useQuota = defaults.bool(forKey: Key.useQuota)
+        updateExistingPhotosToLive = defaults.bool(forKey: Key.updateExistingPhotosToLive)
+        incompleteLivePhotos = IncompleteLivePhotosPolicy(
+            rawValue: defaults.string(forKey: Key.incompleteLivePhotos) ?? ""
+        ) ?? .uploadStill
     }
 
     func toggle(albumID: String) {
@@ -237,6 +262,27 @@ final class PhotoAlbumStore: ObservableObject {
             }
         }
         return sources
+    }
+
+    /// Live Photos in the selected albums, for forgetting still-only completions
+    /// when the user turns on “Update Existing Photos to Live”.
+    func livePhotoSources(for albumIDs: Set<String>) async -> [MediaSource] {
+        let sources = await sources(for: albumIDs)
+        let identifiers = sources.compactMap { source -> String? in
+            if case .asset(let identifier) = source { return identifier }
+            return nil
+        }
+        guard !identifiers.isEmpty else { return [] }
+        return await Task.detached(priority: .utility) {
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+            var live: [MediaSource] = []
+            assets.enumerateObjects { asset, _, _ in
+                if asset.mediaSubtypes.contains(.photoLive) {
+                    live.append(.asset(localIdentifier: asset.localIdentifier))
+                }
+            }
+            return live
+        }.value
     }
 
     /// Recompute "N of M backed up" for the selected albums. `isBackedUp` is

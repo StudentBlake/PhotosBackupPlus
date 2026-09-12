@@ -22,6 +22,8 @@ struct PhotosBackupApp: App {
         let network = NetworkPolicyMonitor()
         stack.queue.options.storageSaver = preferences.storageSaver
         stack.queue.options.useQuota = preferences.useQuota
+        stack.queue.options.updateExistingPhotosToLive = preferences.updateExistingPhotosToLive
+        stack.queue.options.incompleteLivePhotos = preferences.incompleteLivePhotos
         stack.queue.setMaxConcurrent(preferences.concurrentUploads)
         let automaticBackup = AutomaticBackupCoordinator(
             photos: stack,
@@ -94,6 +96,23 @@ struct PhotosBackupApp: App {
                 .onChange(of: preferences.useQuota) { value in
                     DiagnosticEventLog.shared.record("settings", "Count Against Storage Quota turned \(value ? "on" : "off")")
                     queue.options.useQuota = value
+                }
+                .onChange(of: preferences.updateExistingPhotosToLive) { value in
+                    DiagnosticEventLog.shared.record("settings", "Update existing photos to Live turned \(value ? "on" : "off")")
+                    queue.options.updateExistingPhotosToLive = value
+                    if value {
+                        Task {
+                            if albums.albums.isEmpty { await albums.refresh() }
+                            let sources = await albums.livePhotoSources(for: preferences.selectedAlbumIDs)
+                            if queue.forgetCompletedSources(for: sources) > 0 {
+                                automaticBackup.backupConfigurationDidChange()
+                            }
+                        }
+                    }
+                }
+                .onChange(of: preferences.incompleteLivePhotos) { value in
+                    DiagnosticEventLog.shared.record("settings", "Incomplete Live Photos set to \(value.title)")
+                    queue.options.incompleteLivePhotos = value
                 }
                 .onChange(of: preferences.concurrentUploads) { value in
                     DiagnosticEventLog.shared.record("settings", "Simultaneous uploads set to \(value)")

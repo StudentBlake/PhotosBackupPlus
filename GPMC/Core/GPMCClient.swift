@@ -102,9 +102,27 @@ struct GPMCError: LocalizedError, Equatable {
 enum UploadOutcome: Equatable, Sendable {
     case uploaded(mediaKey: String)
     case alreadyBackedUp(mediaKey: String)
-    var mediaKey: String {
-        switch self { case .uploaded(let key), .alreadyBackedUp(let key): return key }
+    case skipped
+    var mediaKey: String? {
+        switch self {
+        case .uploaded(let key), .alreadyBackedUp(let key): return key
+        case .skipped: return nil
+        }
     }
+}
+
+enum LivePhotoDecision: Equatable, Sendable {
+    case alreadyBackedUp(mediaKey: String)
+    case skipRemoteVideo
+    case create
+    case reconcile
+}
+
+enum LivePhotoPreparation: Equatable, Sendable {
+    case alreadyBackedUp(mediaKey: String)
+    case skippedRemoteVideo
+    case create(photo: PreparedUpload, video: PreparedUpload)
+    case reconcile(video: PreparedUpload, photoSHA1: Data)
 }
 
 /// Byte-level progress for one upload. Reported synchronously so it can come
@@ -421,9 +439,26 @@ actor GPMCClient {
     /// upload URL. No long-running body transfer happens in this method.
     func prepareUpload(file: URL, filename: String, modified: Date? = nil,
                        phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadPreparation {
-        let declared = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+        let (hash, size) = try await hashFile(file, phase: phase)
+        phase(.checkingDuplicate)
+        if let key = try await findRemoteMedia(hash: hash) {
+            return .alreadyBackedUp(mediaKey: key)
+        }
+        phase(.preparing)
+        let uploadURL = try await initiateUpload(hash: hash, size: size)
+        let date = modified ?? (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+        return .ready(PreparedUpload(uploadURL: uploadURL, hash: hash, filename: filename,
+                                     modified: date, byteCount: Int64(size), receipt: nil))
+    }
+
+    private func hashFile(_ file: URL, declared: Int64? = nil,
+                          phase: @escaping @Sendable (UploadPhase) -> Void,
+                          fractionRange: ClosedRange<Double> = 0...1) async throws -> (hash: Data, size: UInt64) {
+        let declared = declared ?? (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
         guard declared > 0 else { throw GPMCError(message: "That item is empty; there is nothing to upload.") }
-        phase(.hashing(fraction: 0))
+        let start = fractionRange.lowerBound
+        let span = fractionRange.upperBound - start
+        phase(.hashing(fraction: start))
         let handle = try FileHandle(forReadingFrom: file); defer { try? handle.close() }
         var hasher = Insecure.SHA1(); var size: UInt64 = 0; var reachedEnd = false
         // One pool per chunk. This loop never suspends, so an autoreleased read
@@ -436,26 +471,83 @@ actor GPMCClient {
                     return
                 }
                 try Task.checkCancellation(); hasher.update(data: chunk); size += UInt64(chunk.count)
-                phase(.hashing(fraction: min(1, Double(size) / Double(declared))))
+                let local = min(1, Double(size) / Double(declared))
+                phase(.hashing(fraction: start + local * span))
             }
         }
-        let hash = Data(hasher.finalize())
-        phase(.checkingDuplicate)
+        return (Data(hasher.finalize()), size)
+    }
+
+    private func findRemoteMedia(hash: Data) async throws -> String? {
         let check = Proto.bytes(1, Proto.bytes(1, Proto.bytes(1, hash)) + Proto.bytes(2, Data()))
         let existing = try await rpc(Self.hashCheckMethod, body: check)
-        if let key = try Proto.string(at: [1, 2, 2, 1], in: existing) {
-            return .alreadyBackedUp(mediaKey: key)
-        }
-        phase(.preparing)
+        return try Proto.string(at: [1, 2, 2, 1], in: existing)
+    }
+
+    private func initiateUpload(hash: Data, size: UInt64) async throws -> URL {
         let endpoint = URL(string: "https://photos.googleapis.com/data/upload/uploadmedia/interactive")!
         let body = Proto.int(1, 2) + Proto.int(2, 2) + Proto.int(3, 1) + Proto.int(4, 3) + Proto.int(7, size)
         let (_, response) = try await request(endpoint, body: body, headers: ["X-Goog-Hash": "sha1=" + hash.base64EncodedString(), "X-Upload-Content-Length": String(size)], operation: "upload initialization")
         guard let uploadID = response.value(forHTTPHeaderField: "X-GUploader-UploadID"), !uploadID.isEmpty else { throw GPMCError(message: "Google did not return an upload ID.") }
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
         components.queryItems = [URLQueryItem(name: "upload_id", value: uploadID)]
-        let date = modified ?? (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
-        return .ready(PreparedUpload(uploadURL: components.url!, hash: hash, filename: filename,
-                                     modified: date, byteCount: Int64(size), receipt: nil))
+        return components.url!
+    }
+
+    /// gotohp rule: a remote still is either a skip or a reconcile; a lone
+    /// remote MOV is never paired with a newly uploaded still.
+    static func livePhotoDecision(photoRemoteKey: String?, videoRemoteKey: String?,
+                                  updateExisting: Bool) -> LivePhotoDecision {
+        if let photoRemoteKey, !photoRemoteKey.isEmpty {
+            return updateExisting ? .reconcile : .alreadyBackedUp(mediaKey: photoRemoteKey)
+        }
+        if let videoRemoteKey, !videoRemoteKey.isEmpty { return .skipRemoteVideo }
+        return .create
+    }
+
+    func prepareLivePhoto(photo: URL, video: URL, photoFilename: String, videoFilename: String,
+                          modified: Date?, updateExisting: Bool,
+                          phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> LivePhotoPreparation {
+        let photoDeclared = (try? photo.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+        let videoDeclared = (try? video.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+        let total = max(1, photoDeclared + videoDeclared)
+        let photoEnd = Double(photoDeclared) / Double(total)
+        let (photoHash, photoSize) = try await hashFile(
+            photo, declared: photoDeclared, phase: phase, fractionRange: 0...photoEnd
+        )
+        let (videoHash, videoSize) = try await hashFile(
+            video, declared: videoDeclared, phase: phase, fractionRange: photoEnd...1
+        )
+        phase(.checkingDuplicate)
+        let photoKey = try await findRemoteMedia(hash: photoHash)
+        let videoKey = try await findRemoteMedia(hash: videoHash)
+        switch Self.livePhotoDecision(photoRemoteKey: photoKey, videoRemoteKey: videoKey,
+                                      updateExisting: updateExisting) {
+        case .alreadyBackedUp(let key):
+            return .alreadyBackedUp(mediaKey: key)
+        case .skipRemoteVideo:
+            return .skippedRemoteVideo
+        case .create:
+            phase(.preparing)
+            let date = modified ?? Date()
+            let photoURL = try await initiateUpload(hash: photoHash, size: photoSize)
+            let videoURL = try await initiateUpload(hash: videoHash, size: videoSize)
+            return .create(
+                photo: PreparedUpload(uploadURL: photoURL, hash: photoHash, filename: photoFilename,
+                                      modified: date, byteCount: Int64(photoSize), receipt: nil),
+                video: PreparedUpload(uploadURL: videoURL, hash: videoHash, filename: videoFilename,
+                                      modified: date, byteCount: Int64(videoSize), receipt: nil)
+            )
+        case .reconcile:
+            phase(.preparing)
+            let date = modified ?? Date()
+            let videoURL = try await initiateUpload(hash: videoHash, size: videoSize)
+            return .reconcile(
+                video: PreparedUpload(uploadURL: videoURL, hash: videoHash, filename: videoFilename,
+                                      modified: date, byteCount: Int64(videoSize), receipt: nil),
+                photoSHA1: photoHash
+            )
+        }
     }
 
     /// Run (or reattach to) the file PUT through the injected transport.
@@ -526,6 +618,92 @@ actor GPMCClient {
     /// reports. Exposed so Diagnostics shows exactly what was sent.
     static func commitProfile(useQuota: Bool, saver: Bool) -> (model: String, quality: UInt64) {
         (useQuota ? "Pixel 8" : (saver ? "Pixel 2" : "Pixel XL"), saver ? 1 : 3)
+    }
+
+    /// gotohp Live Photo mapping: storage policy 1 if Storage Saver else 3;
+    /// upload quality is always 1. Device model follows `commitProfile`.
+    static func livePhotoCommitProfile(useQuota: Bool, saver: Bool) -> (model: String, storagePolicy: UInt64, uploadQuality: UInt64) {
+        let profile = commitProfile(useQuota: useQuota, saver: saver)
+        return (profile.model, saver ? 1 : 3, 1)
+    }
+
+    /// Captured official-client result-item mask from gotohp's CreateMediaItems.
+    static let livePhotoResultItemMask = Data(base64Encoded: "CnsKAggBEAEaAggBIgIIASoQCgIIARICCAEaAggBIgIIATICCAGCAQIIAYoBAggBmgECCAGiAQIIAaoBCggBKgIgATICCAHKAQIIAfIBBggBEgIIAfoBAggBggICCAGKAgQKAggBkgIGCAESAggBogICCAGqAgC6AgDCAgAQASpiCAESKggBEhIIARoGCAESAggBIgQIASIAKAEiBggBEgIQASoGCAESAggBMAE4ARoWCAESDAgBGgIIASICCAEoARoCCAEwASIKCAESBggBEgIIASoOCgQIATABEgYIARICCAE6AggBQgIIAUoKCAESAggBGgISAFoSEgIIARoCCAEiCAgBEgQIARACYgIIAXISEgIIARoCCAEiCAgBEgQIARACeggKAggBIgIIAYoBBAoCCAGSAQQIARABqgECCgA=") ?? Data()
+
+    static func livePhotoCreateBody(photoReceipt: Data, videoReceipt: Data, filename: String,
+                                    photoSHA1: Data, videoSHA1: Data, createdAt: Date, modifiedAt: Date,
+                                    useQuota: Bool, saver: Bool) -> Data {
+        let profile = livePhotoCommitProfile(useQuota: useQuota, saver: saver)
+        let stamp = { (date: Date) in
+            Proto.int(1, UInt64(max(0, date.timeIntervalSince1970))) + Proto.int(2, 0)
+        }
+        let liveInfo = Proto.bytes(1, videoReceipt) + Proto.bytes(2, videoSHA1)
+        let blueprint = Proto.bytes(1, photoReceipt) + Proto.string(2, filename) + Proto.bytes(3, photoSHA1)
+            + Proto.bytes(5, stamp(createdAt)) + Proto.bytes(6, stamp(modifiedAt))
+            + Proto.int(7, profile.storagePolicy) + Proto.int(10, profile.uploadQuality)
+            + Proto.bytes(24, liveInfo)
+        let device = Proto.string(3, profile.model) + Proto.string(4, "Google") + Proto.int(5, 28)
+        return Proto.bytes(1, blueprint) + Proto.bytes(2, device) + Proto.bytes(5, livePhotoResultItemMask)
+    }
+
+    static func livePhotoReconcileBody(videoReceipt: Data, filename: String,
+                                       photoSHA1: Data, videoSHA1: Data, createdAt: Date, modifiedAt: Date,
+                                       useQuota: Bool, saver: Bool) -> Data {
+        let profile = livePhotoCommitProfile(useQuota: useQuota, saver: saver)
+        let stamp = { (date: Date) in
+            Proto.int(1, UInt64(max(0, date.timeIntervalSince1970))) + Proto.int(2, 0)
+        }
+        let reconcile = Proto.int(2, 1) + Proto.bytes(3, photoSHA1)
+        let blueprint = Proto.bytes(1, videoReceipt) + Proto.string(2, filename) + Proto.bytes(3, videoSHA1)
+            + Proto.bytes(5, stamp(createdAt)) + Proto.bytes(6, stamp(modifiedAt))
+            + Proto.int(7, profile.storagePolicy) + Proto.int(10, profile.uploadQuality)
+            + Proto.bytes(9, reconcile)
+        let device = Proto.string(3, profile.model) + Proto.string(4, "Google") + Proto.int(5, 28)
+        return Proto.bytes(1, blueprint) + Proto.bytes(2, device) + Proto.bytes(5, livePhotoResultItemMask)
+    }
+
+    func commitLivePhoto(photo: PreparedUpload, video: PreparedUpload, useQuota: Bool, saver: Bool,
+                         phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadOutcome {
+        guard let photoReceipt = photo.receipt, let videoReceipt = video.receipt else {
+            throw GPMCError(message: "The upload has not finished transferring yet.")
+        }
+        try Self.validateReceipt(photoReceipt)
+        try Self.validateReceipt(videoReceipt)
+        phase(.finalizing)
+        let body = Self.livePhotoCreateBody(
+            photoReceipt: photoReceipt, videoReceipt: videoReceipt, filename: photo.filename,
+            photoSHA1: photo.hash, videoSHA1: video.hash, createdAt: photo.modified,
+            modifiedAt: photo.modified, useQuota: useQuota, saver: saver
+        )
+        return try await commitSerialized(body)
+    }
+
+    func reconcileLivePhoto(video: PreparedUpload, photoSHA1: Data, useQuota: Bool, saver: Bool,
+                            phase: @escaping @Sendable (UploadPhase) -> Void) async throws -> UploadOutcome {
+        guard let videoReceipt = video.receipt else {
+            throw GPMCError(message: "The upload has not finished transferring yet.")
+        }
+        try Self.validateReceipt(videoReceipt)
+        phase(.finalizing)
+        let body = Self.livePhotoReconcileBody(
+            videoReceipt: videoReceipt, filename: video.filename, photoSHA1: photoSHA1,
+            videoSHA1: video.hash, createdAt: video.modified, modifiedAt: video.modified,
+            useQuota: useQuota, saver: saver
+        )
+        return try await commitSerialized(body)
+    }
+
+    private func commitSerialized(_ body: Data) async throws -> UploadOutcome {
+        let committed: Data
+        do {
+            committed = try await rpc(Self.commitMethod, body: body, ext: true)
+        } catch let error as GPMCError where Self.rejectsReceipt(error) {
+            throw GPMCError(kind: .invalidUploadReceipt, message: error.message, status: error.status)
+        }
+        guard let key = try Proto.string(at: [1, 3, 1], in: committed) else {
+            throw GPMCError(message: "Google rejected the upload during finalization.")
+        }
+        return .uploaded(mediaKey: key)
     }
 
     /// Commit the receipt. This is intentionally a small data request that runs

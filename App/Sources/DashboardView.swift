@@ -414,7 +414,7 @@ struct DashboardView: View {
 
     private func symbol(_ state: UploadItem.State) -> String {
         switch state {
-        case .done, .alreadyBackedUp: return "checkmark"
+        case .done, .alreadyBackedUp, .skipped: return "checkmark"
         case .failed: return "exclamationmark"
         case .cancelled: return "xmark"
         case .queued, .waitingToRetry, .waitingForICloud: return "clock"
@@ -424,7 +424,7 @@ struct DashboardView: View {
 
     private func tint(_ state: UploadItem.State) -> Color {
         switch state {
-        case .done, .alreadyBackedUp: return .green
+        case .done, .alreadyBackedUp, .skipped: return .green
         case .failed: return .red
         case .cancelled, .waitingToRetry, .waitingForICloud: return .orange
         default: return BackupTheme.blue

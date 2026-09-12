@@ -123,6 +123,8 @@ enum DiagnosticReportBuilder {
         field("Simultaneous uploads", preferences.concurrentUploads)
         field("Storage Saver", preferences.storageSaver)
         field("Count against quota", preferences.useQuota)
+        field("Update existing photos to Live", preferences.updateExistingPhotosToLive)
+        field("Incomplete Live Photos", preferences.incompleteLivePhotos.rawValue)
         let profile = GPMCClient.commitProfile(useQuota: preferences.useQuota, saver: preferences.storageSaver)
         field("Commit profile", "device \(profile.model), quality code \(profile.quality) (\(preferences.storageSaver ? "Storage Saver" : "original"))")
 
@@ -386,6 +388,7 @@ enum DiagnosticReportBuilder {
         case .finalizing: return "finalizing"
         case .alreadyBackedUp: return "already-backed-up"
         case .done: return "done"
+        case .skipped: return "skipped"
         case .cancelled: return "cancelled"
         case .failed: return "failed"
         }

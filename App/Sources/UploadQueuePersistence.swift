@@ -22,6 +22,11 @@ enum PersistedMediaSource: Codable, Equatable, Sendable {
     }
 }
 
+enum LivePhotoCommitKind: String, Codable, Equatable, Sendable {
+    case create
+    case reconcile
+}
+
 /// Durable hand-off between export, background PUT, and commit. A checkpoint
 /// without `prepared` resumes preflight; one with a nil receipt reattaches to
 /// the background task; one with a receipt skips straight to commit.
@@ -37,9 +42,22 @@ struct UploadCheckpoint: Codable, Equatable, Sendable {
     /// A second identical rejection is not the receipt, so the item fails
     /// instead of re-uploading its bytes for every remaining attempt.
     var retriedAfterInvalidReceipt: Bool? = nil
+    var companionFilePath: String? = nil
+    var companionFilename: String? = nil
+    var companionByteCount: Int64? = nil
+    var companionPrepared: PreparedUpload? = nil
+    var companionTransferID: UUID? = nil
+    var liveKind: LivePhotoCommitKind? = nil
+    /// Still SHA-1 for the reconcile commit, which never uploads the still.
+    var reconcilePhotoSHA1: Data? = nil
 
     var fileURL: URL { URL(fileURLWithPath: filePath) }
-    var isBackgroundTransfer: Bool { prepared != nil && continuesAfterProcessExit == true }
+    var companionFileURL: URL? { companionFilePath.map { URL(fileURLWithPath: $0) } }
+    var isBackgroundTransfer: Bool {
+        continuesAfterProcessExit == true
+            && (prepared != nil || companionPrepared != nil)
+    }
+    var isLivePhoto: Bool { companionFilePath != nil || liveKind != nil }
 }
 
 struct PersistedUploadItem: Codable, Equatable, Sendable {

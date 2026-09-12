@@ -85,7 +85,7 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(queue.hasWorkableItems,
                        rows.contains { !$0.state.isFinished && $0.state != .waitingForICloud },
                        "hasWorkableItems", file: file, line: line)
-        let tracked = rows.filter { !$0.state.isFinished || $0.state == .done || $0.state == .alreadyBackedUp }
+        let tracked = rows.filter { !$0.state.isFinished || $0.state == .done || $0.state == .alreadyBackedUp || $0.state == .skipped }
         let expected = tracked.isEmpty
             ? 0
             : tracked.reduce(0) { $0 + ($1.state.fraction ?? 0) } / Double(tracked.count)
@@ -116,6 +116,17 @@ final class UploadQueueTests: XCTestCase {
         await settle(queue) { queue.items.first?.state == .alreadyBackedUp }
         XCTAssertEqual(queue.items.first?.mediaKey, "OLD")
         XCTAssertEqual(queue.failedCount, 0)
+    }
+
+    func testSkippedIsATerminalSuccessThatRemembersTheSource() async {
+        let script = WorkerScript([.succeed(.skipped)])
+        let queue = makeQueue(script)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.state == .skipped }
+        XCTAssertNil(queue.items.first?.mediaKey)
+        XCTAssertEqual(queue.failedCount, 0)
+        XCTAssertEqual(queue.completedSourceCount, 1)
+        assertAggregatesMatchRows(queue)
     }
 
     func testTransportFailuresRetryUpToMaxAttemptsThenFail() async {

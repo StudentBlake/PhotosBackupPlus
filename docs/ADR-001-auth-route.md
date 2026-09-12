@@ -31,7 +31,7 @@ Concrete parameters:
 | Handoff (extension → app) | App Group when the signing team can provision it, `photosbackup://` URL otherwise | Both are implemented and selected at runtime. **Superseded 2026-09-08** — the original "URL handoff must not ship" no longer holds; see Distribution below. |
 | Distribution | Unsigned `.ipa`, sideloaded with SideStore (`Scripts/make-ipa.sh`) | No App Store review, no paid membership required. SideStore re-signs on device with the user's Apple ID. |
 | Upstream refs | GPMC `94b1b267…` for protocol; gotohp `0637c745…` for auth + protocol fixes | Preserve MIT notices from both. |
-| First-release scope | Account connect + explicit photo/video upload + activity queue. Live Photos, background transfer hardening, Android-credential import (incl. token binding) are follow-ups. | Keep the first release provable end to end. |
+| First-release scope | Account connect + explicit photo/video upload + activity queue. Live Photos now use gotohp’s linked create/reconcile commit. Background transfer hardening and Android-credential import (incl. token binding) remain follow-ups. | Keep the first release provable end to end. |
 
 ## Open question this ADR is blocked on
 

@@ -9,6 +9,10 @@ struct UploadOptions: Equatable, Sendable {
     /// Background processing must never spend its short CPU window downloading
     /// a cloud-only PhotoKit resource. Foreground work may opt back in.
     var allowsICloudDownload = true
+    /// Attach the motion track to a still that is already in Google Photos.
+    var updateExistingPhotosToLive = false
+    /// When PhotoKit has no paired-video resource for a Live Photo.
+    var incompleteLivePhotos: IncompleteLivePhotosPolicy = .uploadStill
 }
 
 /// One row of the activity list.
@@ -24,12 +28,13 @@ struct UploadItem: Identifiable, Equatable, Sendable {
         case finalizing
         case alreadyBackedUp
         case done
+        case skipped
         case cancelled
         case failed(reason: String, retryable: Bool)
 
         var isFinished: Bool {
             switch self {
-            case .alreadyBackedUp, .done, .cancelled, .failed: return true
+            case .alreadyBackedUp, .done, .skipped, .cancelled, .failed: return true
             default: return false
             }
         }
@@ -46,7 +51,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
             case .checkingDuplicate: return 0.1
             case .uploading(let f): return 0.1 + f * 0.85
             case .finalizing: return 0.95
-            case .alreadyBackedUp, .done: return 1
+            case .alreadyBackedUp, .done, .skipped: return 1
             default: return nil
             }
         }
@@ -62,6 +67,7 @@ struct UploadItem: Identifiable, Equatable, Sendable {
             case .finalizing: return "Finishing"
             case .alreadyBackedUp: return "Already backed up"
             case .done: return "Backed up"
+            case .skipped: return "Skipped"
             case .cancelled: return "Cancelled"
             case .failed(let reason, _): return reason
             }
@@ -221,7 +227,7 @@ final class UploadQueue: ObservableObject {
         var unfinished = 0
         var failed = 0
         var waitingForICloud = 0
-        /// `.done` plus `.alreadyBackedUp`.
+        /// `.done`, `.alreadyBackedUp`, and `.skipped`.
         var completed = 0
         var finished = 0
     }
@@ -245,7 +251,7 @@ final class UploadQueue: ObservableObject {
 
     private func tally(_ state: UploadItem.State, by delta: Int) {
         switch state {
-        case .done, .alreadyBackedUp: counts.completed += delta; counts.finished += delta
+        case .done, .alreadyBackedUp, .skipped: counts.completed += delta; counts.finished += delta
         case .failed: counts.failed += delta; counts.finished += delta
         case .cancelled: counts.finished += delta
         case .waitingForICloud: counts.waitingForICloud += delta; counts.unfinished += delta
@@ -336,9 +342,24 @@ final class UploadQueue: ObservableObject {
             ?? networkPauseReason
             ?? systemPauseReason
     }
-    var retainedStagingURLs: Set<URL> { Set(items.compactMap { $0.checkpoint?.fileURL }) }
+    var retainedStagingURLs: Set<URL> {
+        Set(items.flatMap { item -> [URL] in
+            guard let checkpoint = item.checkpoint else { return [] }
+            var urls = [checkpoint.fileURL]
+            if let companion = checkpoint.companionFileURL { urls.append(companion) }
+            return urls
+        })
+    }
     var retainedTransferIDs: Set<UUID> {
-        Set(items.compactMap { item in item.checkpoint?.prepared == nil ? nil : item.id })
+        Set(items.flatMap { item -> [UUID] in
+            guard let checkpoint = item.checkpoint else { return [] }
+            var ids: [UUID] = []
+            if checkpoint.prepared != nil { ids.append(item.id) }
+            if checkpoint.companionPrepared != nil, let companionID = checkpoint.companionTransferID {
+                ids.append(companionID)
+            }
+            return ids
+        })
     }
     var runningCount: Int { running.count }
     /// Running rows whose bytes are already moving in an iOS background
@@ -517,7 +538,8 @@ final class UploadQueue: ObservableObject {
 
     func retry(_ id: UUID) {
         guard let index = index(of: id), items[index].state.isFinished,
-              items[index].state != .done, items[index].state != .alreadyBackedUp else { return }
+              items[index].state != .done, items[index].state != .alreadyBackedUp,
+              items[index].state != .skipped else { return }
         requeue(at: index)
         persistNow()
         pump()
@@ -953,7 +975,13 @@ final class UploadQueue: ObservableObject {
         guard let index = index(of: id) else { return }
         switch outcome {
         case .success(let result):
-            let settled: UploadItem.State = { if case .alreadyBackedUp = result { return .alreadyBackedUp } else { return .done } }()
+            let settled: UploadItem.State = {
+                switch result {
+                case .alreadyBackedUp: return .alreadyBackedUp
+                case .skipped: return .skipped
+                case .uploaded: return .done
+                }
+            }()
             items[index].mediaKey = result.mediaKey
             setState(settled, at: index)
             if let key = items[index].source.queueDeduplicationKey { completedSourceKeys.insert(key) }
@@ -1125,7 +1153,7 @@ final class UploadQueue: ObservableObject {
                     ?? item.checkpoint.map({ .file($0.filePath) }) else { return nil }
             let interruptions = item.interruptedPreparations > 0 ? item.interruptedPreparations : nil
             switch item.state {
-            case .alreadyBackedUp, .done:
+            case .alreadyBackedUp, .done, .skipped:
                 return nil
             case .cancelled:
                 // Kept so a deliberate cancellation is not silently undone by

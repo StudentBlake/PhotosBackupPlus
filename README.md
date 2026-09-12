@@ -22,6 +22,8 @@ without a desktop companion or hosted service.
 - Exchange the token for a Google Photos credential entirely on the device.
 - Select albums from the local Photos library.
 - Queue individual photos, videos, or all items in selected albums.
+- Upload Live Photos as a still plus motion pair, with optional upgrade of
+  stills already in Google Photos.
 - Show hashing, duplicate-check, upload, and finalization progress per item.
 - Avoid re-uploading media already present in Google Photos.
 - Retry transient failures, cancel work, and resume after reconnecting.
@@ -60,7 +62,7 @@ The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
 Latest release: **0.3.6** ([releases](https://github.com/g8row/PhotosBackup/releases)).
-161 tests run on an iPhone simulator: 158 pass. The 2 opt-in live tests and
+177 tests run on an iPhone simulator: 174 pass. The 2 opt-in live tests and
 the Keychain round trip, which needs a signed build, are skipped.
 
 ### App identity (since 0.0.2)
@@ -231,8 +233,10 @@ Android master token → Photos access token → private Photos API
 ## Known limitations
 
 - Google can change or disable the private authentication and Photos endpoints.
-- Live Photos currently upload only their still image; the motion component is
-  ignored.
+- Live Photos upload the still and motion together. A still that is already in
+  Google Photos stays a still unless **Update Existing Photos to Live** is on.
+  A Live Photo with no motion file in PhotoKit follows **Incomplete Live Photos**
+  (upload the still, or skip).
 - Background album backup is opportunistic: iOS decides when each processing
   request runs and may delay it based on usage, battery, and system policy.
 - Shortcuts can create extra backup opportunities on iOS 16+, but iOS gives

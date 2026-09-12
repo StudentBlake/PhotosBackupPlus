@@ -132,10 +132,16 @@ struct SettingsView: View {
             }
             Toggle("Storage Saver", isOn: $preferences.storageSaver)
             Toggle("Count Against Storage Quota", isOn: $preferences.useQuota)
+            Toggle("Update Existing Photos to Live", isOn: $preferences.updateExistingPhotosToLive)
+            Picker("Incomplete Live Photos", selection: $preferences.incompleteLivePhotos) {
+                ForEach(IncompleteLivePhotosPolicy.allCases) { option in
+                    Text(option.title).tag(option)
+                }
+            }
         } header: {
             Text("Backup")
         } footer: {
-            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. With Count Against Storage Quota off, uploads identify as an older Pixel phone so they don't use your Google storage; the Google Photos app may then label them “Storage saver” even though the original file was kept. The file size, or Google Photos on the web, shows the real quality. Live Photos currently back up as still images.")
+            Text("More simultaneous uploads finish a large backup sooner. Each one stages a full-size copy on the device while it runs, so high values use more storage, battery and data at once — 2 suits most phones. Lowering it lets uploads already running finish first.\n\nStorage Saver asks Google Photos to reduce file size. With Count Against Storage Quota off, uploads identify as an older Pixel phone so they don't use your Google storage; the Google Photos app may then label them “Storage saver” even though the original file was kept. The file size, or Google Photos on the web, shows the real quality.\n\nLive Photos upload the still and the motion together. Update Existing Photos to Live attaches the motion file when the still is already in Google Photos. Incomplete Live Photos applies only when PhotoKit has no motion file at all — a motion file that is only in iCloud still waits until it can be downloaded.")
         }
     }
 
