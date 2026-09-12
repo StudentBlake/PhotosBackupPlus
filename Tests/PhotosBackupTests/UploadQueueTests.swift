@@ -44,6 +44,15 @@ private extension NSLock {
     func sync<T>(_ body: () -> T) -> T { lock(); defer { unlock() }; return body() }
 }
 
+final class CallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var value = 0
+    private(set) var ids: [UUID] = []
+
+    func increment() { lock.sync { value += 1 } }
+    func note(_ id: UUID) { lock.sync { ids.append(id); value += 1 } }
+}
+
 @MainActor
 final class UploadQueueTests: XCTestCase {
 
@@ -85,6 +94,8 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(queue.hasWorkableItems,
                        rows.contains { !$0.state.isFinished && $0.state != .waitingForICloud },
                        "hasWorkableItems", file: file, line: line)
+        XCTAssertEqual(queue.waitingForExecutionCount, rows.filter(\.needsAppExecution).count,
+                       "waitingForExecutionCount", file: file, line: line)
         let tracked = rows.filter { !$0.state.isFinished || $0.state == .done || $0.state == .alreadyBackedUp || $0.state == .skipped }
         let expected = tracked.isEmpty
             ? 0
@@ -318,6 +329,150 @@ final class UploadQueueTests: XCTestCase {
         XCTAssertEqual(queue.items.first?.checkpoint, checkpoint)
         queue.cancelAll()
         await settle(queue) { queue.items.isEmpty }
+    }
+
+    /// Leaving the app disables new iCloud downloads. That must not cancel a
+    /// local-file worker that is already exporting, hashing or committing.
+    func testDisablingICloudDownloadsDoesNotCancelALocalFileWorker() async {
+        let script = WorkerScript([.block], fallback: .succeed(.uploaded(mediaKey: "ABC")))
+        let queue = makeQueue(script, maxConcurrent: 1)
+        queue.enqueue(oneSource)
+        await settle(queue) { queue.items.first?.state.isWorking == true }
+
+        queue.setICloudDownloadsAllowed(false)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertTrue(queue.items.first?.state.isWorking == true)
+        XCTAssertEqual(script.calls, 1)
+        XCTAssertNil(queue.systemPauseReason)
+        queue.cancelAll()
+        await settle(queue) { queue.items.isEmpty }
+    }
+
+    /// A row whose bytes are already with iOS does not keep leftover app time
+    /// alive; a receipt that still needs commit does.
+    func testNeedsAppExecutionIgnoresIOSOwnedTransfersAndCountsPendingCommits() async throws {
+        let transferring = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 1, count: 20),
+            filename: "photo.jpg", modified: Date(), byteCount: 10, receipt: nil
+        )
+        let committed = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 2, count: 20),
+            filename: "done.jpg", modified: Date(), byteCount: 10, receipt: Data([1])
+        )
+        let transferringID = UUID()
+        let commitID = UUID()
+        let persistence = MemoryUploadQueuePersistence(snapshot: UploadQueueSnapshot(
+            version: UploadQueueSnapshot.version,
+            accountIdentifier: "person@gmail.com",
+            items: [
+                PersistedUploadItem(
+                    id: transferringID, source: .asset("photo"), name: "photo.jpg",
+                    byteCount: 10, attempts: 0, failureReason: nil, failureRetryable: false,
+                    checkpoint: UploadCheckpoint(
+                        filePath: "/tmp/photo.jpg", filename: "photo.jpg", modified: Date(),
+                        byteCount: 10, temporary: true, prepared: transferring,
+                        continuesAfterProcessExit: true
+                    )
+                ),
+                PersistedUploadItem(
+                    id: commitID, source: .asset("done"), name: "done.jpg",
+                    byteCount: 10, attempts: 0, failureReason: nil, failureRetryable: false,
+                    checkpoint: UploadCheckpoint(
+                        filePath: "/tmp/done.jpg", filename: "done.jpg", modified: Date(),
+                        byteCount: 10, temporary: true, prepared: committed,
+                        continuesAfterProcessExit: true
+                    )
+                )
+            ],
+            completedSourceKeys: []
+        ))
+        let queue = UploadQueue(worker: WorkerScript([]).worker(), maxConcurrent: 1, persistence: persistence)
+        queue.setNetworkAccess(allowed: false, pauseReason: "Holding")
+        queue.activateAccount("person@gmail.com")
+
+        let transferringRow = try XCTUnwrap(queue.items.first { $0.id == transferringID })
+        let commitRow = try XCTUnwrap(queue.items.first { $0.id == commitID })
+        XCTAssertFalse(transferringRow.needsAppExecution)
+        XCTAssertTrue(commitRow.needsAppExecution)
+        XCTAssertEqual(queue.waitingForExecutionCount, 1)
+        XCTAssertTrue(queue.needsAppExecution)
+    }
+
+    /// During leave-grace, a worker that has handed its PUT to iOS must free
+    /// the preparation slot so another export can start.
+    func testHandoffPriorityStartsAnotherExportWhileATransferIsWithIOS() async throws {
+        let prepared = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 4, count: 20),
+            filename: "photo.jpg", modified: Date(), byteCount: 10, receipt: nil
+        )
+        let checkpoint = UploadCheckpoint(
+            filePath: "/tmp/photo.jpg", filename: "photo.jpg", modified: Date(),
+            byteCount: 10, temporary: true, prepared: prepared, continuesAfterProcessExit: true
+        )
+        let started = CallCounter()
+        let worker: UploadWorker = { _, _, _, _, emit in
+            started.increment()
+            await emit(.checkpoint(checkpoint))
+            await emit(.state(.uploading(fraction: 0.1)))
+            while true { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        let queue = UploadQueue(worker: worker, maxConcurrent: 1)
+        queue.setHandoffPriority(true)
+        queue.enqueue(sources(3))
+        await settle(queue) { started.value >= 2 }
+
+        XCTAssertGreaterThanOrEqual(queue.runningCount, 2)
+        XCTAssertGreaterThanOrEqual(queue.runningBackgroundTransferCount, 1)
+        XCTAssertLessThanOrEqual(queue.runningCount, UploadQueue.maxOutstandingHandoffs + 1)
+        let summary = try XCTUnwrap(queue.continuationSummary)
+        XCTAssertTrue(summary.contains("transferring in iOS"), summary)
+        queue.cancelAll()
+        await settle(queue) { queue.items.isEmpty }
+    }
+
+    func testHandoffPriorityPrefersAPendingCommitOverAFreshExport() async {
+        let committed = PreparedUpload(
+            uploadURL: URL(string: "https://example.com/upload")!, hash: Data(repeating: 5, count: 20),
+            filename: "ready.jpg", modified: Date(), byteCount: 10, receipt: Data([9])
+        )
+        let checkpoint = UploadCheckpoint(
+            filePath: "/tmp/ready.jpg", filename: "ready.jpg", modified: Date(),
+            byteCount: 10, temporary: true, prepared: committed, continuesAfterProcessExit: true
+        )
+        let freshID = UUID()
+        let readyID = UUID()
+        let seen = CallCounter()
+        let worker: UploadWorker = { id, _, restored, _, _ in
+            seen.note(id)
+            if restored?.hasPendingCommit == true {
+                return .uploaded(mediaKey: "COMMITTED")
+            }
+            while true { try await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        let persistence = MemoryUploadQueuePersistence(snapshot: UploadQueueSnapshot(
+            version: UploadQueueSnapshot.version,
+            accountIdentifier: "person@gmail.com",
+            items: [
+                PersistedUploadItem(id: freshID, source: .asset("fresh"), name: "fresh.jpg",
+                                    byteCount: 0, attempts: 0, failureReason: nil, failureRetryable: false),
+                PersistedUploadItem(id: readyID, source: .asset("ready"), name: "ready.jpg",
+                                    byteCount: 10, attempts: 0, failureReason: nil, failureRetryable: false,
+                                    checkpoint: checkpoint)
+            ],
+            completedSourceKeys: []
+        ))
+        let queue = UploadQueue(worker: worker, maxConcurrent: 1, persistence: persistence)
+        queue.setNetworkAccess(allowed: false, pauseReason: "Holding")
+        queue.setHandoffPriority(true)
+        queue.activateAccount("person@gmail.com")
+        queue.setNetworkAccess(allowed: true)
+
+        await settle(queue) { queue.items.contains { $0.id == readyID && $0.state == .done } }
+        XCTAssertEqual(queue.items.first(where: { $0.id == readyID })?.state, .done)
+        XCTAssertEqual(seen.ids.first, readyID)
+        queue.cancelAll()
+        await settle(queue) { queue.items.allSatisfy { $0.state.isFinished || $0.state == .cancelled } }
     }
 
     func testURLSessionRelaunchOnlyPumpsCheckpointedTransfers() async {

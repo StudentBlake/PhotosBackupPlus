@@ -20,7 +20,15 @@ struct UploadsView: View {
         NavigationView {
             List {
                 manualBackupSection
-                if let reason = queue.pauseReason { pausedSection(reason) }
+                if queue.haltReason != nil || queue.isUserPaused || queue.networkPauseReason != nil,
+                   let reason = queue.pauseReason {
+                    pausedSection(reason)
+                } else if let summary = queue.continuationSummary,
+                          queue.systemPauseReason != nil || queue.runningBackgroundTransferCount > 0 {
+                    continuationSection(summary)
+                } else if let reason = queue.pauseReason {
+                    pausedSection(reason)
+                }
                 if let warning = queue.persistenceWarning { persistenceWarningSection(warning) }
                 if queue.items.isEmpty { emptySection }
                 else {
@@ -69,6 +77,16 @@ struct UploadsView: View {
             .disabled(!account.status.isUsable)
         } footer: {
             if !account.status.isUsable { Text("Connect a Google Photos account before starting a backup.") }
+        }
+    }
+
+    private func continuationSection(_ summary: String) -> some View {
+        let transferring = queue.runningBackgroundTransferCount > 0
+        return Section {
+            Label(transferring ? "Continuing in iOS" : "Backup Waiting",
+                  systemImage: transferring ? "arrow.up.circle.fill" : "clock.fill")
+                .foregroundStyle(transferring ? BackupTheme.blue : .orange)
+            Text(summary).font(.footnote).foregroundStyle(.secondary)
         }
     }
 
@@ -167,9 +185,18 @@ struct UploadsView: View {
                 if !queue.isIdle { Text("\(queue.activeCount) remaining") }
             }
         } footer: {
-            if queue.deferredForICloudCount > 0 {
-                Text("\(queue.deferredForICloudCount) items need to download from iCloud first. Keep the app open to finish them.")
-            }
+            let parts = [
+                queue.runningBackgroundTransferCount > 0
+                    ? "\(queue.runningBackgroundTransferCount) transferring in iOS, even if you leave the app."
+                    : nil,
+                queue.waitingForExecutionCount > 0 && queue.systemPauseReason != nil
+                    ? "\(queue.waitingForExecutionCount) waiting for another execution window."
+                    : nil,
+                queue.deferredForICloudCount > 0
+                    ? "\(queue.deferredForICloudCount) items need to download from iCloud first. Keep the app open to finish them."
+                    : nil
+            ].compactMap { $0 }
+            if !parts.isEmpty { Text(parts.joined(separator: " ")) }
         }
     }
 

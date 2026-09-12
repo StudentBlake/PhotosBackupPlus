@@ -88,8 +88,18 @@ struct DashboardView: View {
         case .connected:
             if let warning = account.persistenceWarning {
                 banner(color: .orange, symbol: "key.slash", title: "Not saved to Keychain", message: warning, showsChevron: false)
-            } else if let reason = queue.pauseReason {
+            } else if queue.haltReason != nil || queue.isUserPaused || queue.networkPauseReason != nil,
+                      let reason = queue.pauseReason {
                 banner(color: .orange, symbol: "pause.circle.fill", title: "Backup paused", message: reason, showsChevron: false)
+            } else if let summary = queue.continuationSummary {
+                let waitingOnly = queue.systemPauseReason != nil && queue.runningBackgroundTransferCount == 0
+                banner(
+                    color: waitingOnly ? .orange : BackupTheme.blue,
+                    symbol: waitingOnly ? "clock.fill" : "arrow.up.circle.fill",
+                    title: waitingOnly ? "Backup waiting" : "Backup continuing",
+                    message: summary,
+                    showsChevron: false
+                )
             }
         case .rejected(_, let reason):
             Button(action: onConnect) {
@@ -333,6 +343,13 @@ struct DashboardView: View {
 
     private var heroTitle: String {
         if !account.status.isUsable { return "Connect to back up" }
+        if queue.haltReason != nil || queue.isUserPaused || queue.networkPauseReason != nil {
+            return "Backup paused"
+        }
+        if queue.runningBackgroundTransferCount > 0 || automaticBackup.continuationKind != .none {
+            return "Backing up…"
+        }
+        if queue.systemPauseReason != nil { return "Backup waiting" }
         if queue.pauseReason != nil { return "Backup paused" }
         if !queue.isIdle { return "Backing up…" }
         if queue.failedCount > 0 { return "Backup needs attention" }
@@ -342,6 +359,9 @@ struct DashboardView: View {
 
     private var heroSubtitle: String {
         if !account.status.isUsable { return "Connect an account to get started" }
+        if let summary = queue.continuationSummary, !queue.isIdle || queue.systemPauseReason != nil {
+            return summary
+        }
         if let reason = queue.pauseReason { return reason }
         if !queue.isIdle { return "\(queue.activeCount) items remaining" }
         if queue.failedCount > 0 { return "\(queue.failedCount) items failed — open Activity to retry" }
@@ -349,20 +369,27 @@ struct DashboardView: View {
         return "Your selected albums are up to date"
     }
 
+    private var isHardPause: Bool {
+        queue.haltReason != nil || queue.isUserPaused || queue.networkPauseReason != nil
+    }
+
     private var heroProgress: Double {
-        if !account.status.isUsable || queue.pauseReason != nil { return 0.18 }
+        if !account.status.isUsable || isHardPause { return 0.18 }
+        if queue.systemPauseReason != nil, queue.runningBackgroundTransferCount == 0 { return 0.18 }
         return queue.isIdle ? 1 : max(queue.overallFraction, 0.04)
     }
 
     private var heroTint: Color {
-        if !account.status.isUsable || queue.pauseReason != nil { return .orange }
+        if !account.status.isUsable || isHardPause { return .orange }
+        if queue.systemPauseReason != nil, queue.runningBackgroundTransferCount == 0 { return .orange }
         if queue.failedCount > 0 { return .red }
         return queue.isIdle ? .green : BackupTheme.blue
     }
 
     private var heroSymbol: String {
         if !account.status.isUsable { return "link" }
-        if queue.pauseReason != nil { return "pause.fill" }
+        if isHardPause { return "pause.fill" }
+        if queue.systemPauseReason != nil, queue.runningBackgroundTransferCount == 0 { return "clock.fill" }
         if queue.failedCount > 0 { return "exclamationmark" }
         return queue.isIdle ? "checkmark" : "arrow.up"
     }

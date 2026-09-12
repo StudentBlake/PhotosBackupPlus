@@ -90,6 +90,21 @@ struct UploadItem: Identifiable, Equatable, Sendable {
         self.id = id; self.source = source; self.name = name
         byteCount = 0; state = .queued; attempts = 0
     }
+
+    /// A receipt or an iOS-owned PUT: these should not consume a preparation
+    /// slot once handoff is prioritized.
+    var usesHandoffSlot: Bool {
+        checkpoint?.hasPendingCommit == true || checkpoint?.isBackgroundTransfer == true
+    }
+
+    /// Still needs this process: export, hash, prepare, or commit. An iOS-owned
+    /// PUT without a receipt, or a row parked on iCloud, does not.
+    var needsAppExecution: Bool {
+        if state.isFinished || state == .waitingForICloud { return false }
+        if checkpoint?.hasPendingCommit == true { return true }
+        if checkpoint?.isBackgroundTransfer == true { return false }
+        return true
+    }
 }
 
 /// What a worker tells the queue while it runs one item.
@@ -204,6 +219,13 @@ final class UploadQueue: ObservableObject {
     /// Off until the coordinator says the app is executing; see
     /// `setPreparationGuardArmed`.
     private var preparationGuardArmed = false
+    /// While the app is spending leftover time after leave, or an iOS 26
+    /// continued-processing task, prefer commits and let more items reach iOS
+    /// than `maxConcurrent` full workers.
+    private var prioritizeHandoff = false { didSet { scanCursor = 0 } }
+    /// Outstanding iOS-owned transfers allowed on top of the preparation cap
+    /// while `prioritizeHandoff` is on.
+    static let maxOutstandingHandoffs = 10
     /// A row the process has died on this many times is skipped, so a single
     /// item that reliably takes the app down cannot stop every relaunch from
     /// making progress on the rest.
@@ -233,6 +255,9 @@ final class UploadQueue: ObservableObject {
     }
 
     private var counts = RowCounts()
+    /// Unfinished rows that still need this process. Checkpoint changes can
+    /// flip it without a state change, so it is not part of `RowCounts`.
+    private var executionNeededCount = 0
     /// Row offset by id, so the event path does not scan for its own row.
     private var indexByID: [UUID: Int] = [:]
     /// Dedup keys for every row `items` currently holds, whatever its state, so
@@ -263,9 +288,11 @@ final class UploadQueue: ObservableObject {
     /// and the scan cursor cannot drift away from `items`.
     private func setState(_ state: UploadItem.State, at index: Int) {
         let id = items[index].id
+        let neededBefore = items[index].needsAppExecution
         tally(items[index].state, by: -1)
         tally(state, by: 1)
         items[index].state = state
+        executionNeededCount += (items[index].needsAppExecution ? 1 : 0) - (neededBefore ? 1 : 0)
         if !state.isFinished, state.fraction != nil { fractionalIDs.insert(id) }
         else { fractionalIDs.remove(id) }
         if state == .queued { scanCursor = min(scanCursor, index) }
@@ -279,6 +306,7 @@ final class UploadQueue: ObservableObject {
             indexByID[row.id] = items.count + offset
             if let key = row.source.queueDeduplicationKey { queuedSourceKeys.insert(key) }
             tally(row.state, by: 1)
+            if row.needsAppExecution { executionNeededCount += 1 }
         }
         scanCursor = min(scanCursor, items.count)
         items.append(contentsOf: rows)
@@ -289,6 +317,7 @@ final class UploadQueue: ObservableObject {
     /// user actions or a one-off restore, never the per-tick event path.
     private func rebuildDerivedState() {
         counts = RowCounts()
+        executionNeededCount = 0
         indexByID.removeAll(keepingCapacity: true)
         queuedSourceKeys.removeAll(keepingCapacity: true)
         fractionalIDs.removeAll(keepingCapacity: true)
@@ -298,6 +327,7 @@ final class UploadQueue: ObservableObject {
             indexByID[item.id] = offset
             if let key = item.source.queueDeduplicationKey { queuedSourceKeys.insert(key) }
             tally(item.state, by: 1)
+            if item.needsAppExecution { executionNeededCount += 1 }
             if !item.state.isFinished, item.state.fraction != nil { fractionalIDs.insert(item.id) }
         }
     }
@@ -369,6 +399,32 @@ final class UploadQueue: ObservableObject {
             guard let index = indexByID[id], items[index].checkpoint?.isBackgroundTransfer == true else { return count }
             return count + 1
         }
+    }
+    /// Unfinished rows that still need CPU time (export, hash, prepare, commit)
+    /// rather than just waiting on an iOS-owned PUT or an iCloud original.
+    var waitingForExecutionCount: Int { executionNeededCount }
+    /// True when some unfinished row still needs this process to run. iOS-owned
+    /// PUTs and iCloud-deferred rows do not keep a leave-grace task alive.
+    var needsAppExecution: Bool { executionNeededCount > 0 }
+    /// What is still moving after the user leaves, in terms they can read.
+    var continuationSummary: String? {
+        let transferring = runningBackgroundTransferCount
+        let waiting = waitingForExecutionCount
+        let icloud = deferredForICloudCount
+        guard transferring > 0 || waiting > 0 || icloud > 0 else { return nil }
+        var parts: [String] = []
+        if transferring > 0 {
+            parts.append(transferring == 1 ? "1 transferring in iOS" : "\(transferring) transferring in iOS")
+        }
+        if waiting > 0 {
+            parts.append(systemPauseReason != nil
+                ? (waiting == 1 ? "1 waiting for another execution window" : "\(waiting) waiting for another execution window")
+                : (waiting == 1 ? "1 still preparing" : "\(waiting) still preparing"))
+        }
+        if icloud > 0 {
+            parts.append(icloud == 1 ? "1 waiting on iCloud" : "\(icloud) waiting on iCloud")
+        }
+        return parts.joined(separator: " · ")
     }
     /// Cancelled and failed rows are excluded, finished ones count as a whole
     /// item, and the only rows left with a moving fraction are the ones actually
@@ -846,8 +902,24 @@ final class UploadQueue: ObservableObject {
             }
             persist()
             pump()
-        } else {
-            cancelRunningForRequeue()
+        }
+        // Refusing new iCloud originals must not cancel a local-file export,
+        // hash, prepare, PUT or commit that is already running. New starts
+        // pick up the updated option and park as `.waitingForICloud` if they
+        // still need a download.
+    }
+
+    /// Prefer commits and submit more PUTs than `maxConcurrent` full workers.
+    /// Used during leave-grace and iOS 26 continued processing.
+    func setHandoffPriority(_ enabled: Bool) {
+        guard prioritizeHandoff != enabled else { return }
+        prioritizeHandoff = enabled
+        if enabled {
+            DiagnosticEventLog.shared.record(
+                "queue",
+                "Prioritizing upload handoff: confirm finished transfers first, then submit more files to iOS"
+            )
+            pump()
         }
     }
 
@@ -900,8 +972,31 @@ final class UploadQueue: ObservableObject {
 
     private func pump() {
         guard haltReason == nil, networkPauseReason == nil, systemPauseReason == nil else { return }
-        while running.count < maxConcurrent, let index = nextStartableIndex() {
+        while let index = nextStartableIndex(), canStart(at: index) {
             start(at: index)
+        }
+    }
+
+    private func canStart(at index: Int) -> Bool {
+        guard items.indices.contains(index) else { return false }
+        if !prioritizeHandoff { return running.count < maxConcurrent }
+        if items[index].usesHandoffSlot {
+            return outstandingHandoffCount < Self.maxOutstandingHandoffs
+        }
+        return preparingCount < maxConcurrent
+    }
+
+    private var preparingCount: Int {
+        running.keys.reduce(0) { count, id in
+            guard let index = indexByID[id] else { return count + 1 }
+            return items[index].usesHandoffSlot ? count : count + 1
+        }
+    }
+
+    private var outstandingHandoffCount: Int {
+        running.keys.reduce(0) { count, id in
+            guard let index = indexByID[id] else { return count }
+            return items[index].usesHandoffSlot ? count + 1 : count
         }
     }
 
@@ -911,6 +1006,14 @@ final class UploadQueue: ObservableObject {
     /// finished prefix — the queue got slower the more of it had succeeded, and
     /// the cost landed on the main actor between every pair of uploads.
     private func nextStartableIndex() -> Int? {
+        if prioritizeHandoff {
+            if let index = firstQueuedIndex(where: { $0.checkpoint?.hasPendingCommit == true }) {
+                return index
+            }
+            if let index = firstQueuedIndex(where: { $0.checkpoint?.isBackgroundTransfer == true }) {
+                return index
+            }
+        }
         while scanCursor < items.count {
             if items[scanCursor].state == .queued {
                 // A pause still lets a row whose bytes are already moving in an
@@ -919,6 +1022,16 @@ final class UploadQueue: ObservableObject {
                 if items[scanCursor].checkpoint?.isBackgroundTransfer == true { return scanCursor }
             }
             scanCursor += 1
+        }
+        return nil
+    }
+
+    private func firstQueuedIndex(where matches: (UploadItem) -> Bool) -> Int? {
+        for index in items.indices where items[index].state == .queued && matches(items[index]) {
+            if drainsBackgroundCompletionsOnly || isUserPaused {
+                guard items[index].checkpoint?.isBackgroundTransfer == true else { continue }
+            }
+            return index
         }
         return nil
     }
@@ -960,11 +1073,16 @@ final class UploadQueue: ObservableObject {
             guard !items[index].state.isFinished else { return }
             setState(state, at: index)
         case .checkpoint(let checkpoint):
+            let neededBefore = items[index].needsAppExecution
             items[index].checkpoint = checkpoint
+            executionNeededCount += (items[index].needsAppExecution ? 1 : 0) - (neededBefore ? 1 : 0)
             if checkpoint?.prepared != nil { clearPreparationMarker(id) }
             // The durable hand-off to the background transfer: this must be on
             // disk before the worker proceeds, not on the next turn.
             persistNow()
+            // A row that just reached iOS frees a preparation slot. Start the
+            // next export while this one waits on the system transfer.
+            if prioritizeHandoff { pump() }
         }
     }
 

@@ -9,6 +9,8 @@ import UIKit
 @MainActor
 final class AutomaticBackupCoordinator: ObservableObject {
     static let taskIdentifier = "com.g8row.photosbackup.background-backup"
+    static let continuedTaskIdentifier = "com.g8row.photosbackup.continue-backup"
+    static let leaveGraceTaskName = "photosbackup.leave-grace"
     private nonisolated static let logger = Logger(subsystem: "com.g8row.photosbackup", category: "automatic-backup")
 
     /// How many sources one background enqueue pass may append. This bounds
@@ -49,12 +51,42 @@ final class AutomaticBackupCoordinator: ObservableObject {
     private let libraryChanges: PhotoLibraryChangeTracker
 
     private var registered = false
+    private var continuedRegistered = false
     private var ranForegroundBackup = false
     private var isForeground = true
     private var shouldRunAfterActivation = false
     private var backgroundOperation: Task<Void, Never>?
     private var foregroundOperation: Task<Void, Never>?
     private var foregroundRunID: UUID?
+    private var leaveGraceTaskID = UIBackgroundTaskIdentifier.invalid
+    private var leaveGraceMonitor: Task<Void, Never>?
+    private var leaveGraceActive = false
+    private var continuedProcessingActive = false
+    private var pendingContinuedSources: [MediaSource]?
+    private var pendingContinuedRunSource: AutomaticBackupRunSource?
+    private var continuedOperation: Task<Void, Never>?
+    /// What is keeping an in-progress backup alive after the user left.
+    @Published private(set) var continuationKind: BackupContinuationKind = .none
+
+    enum BackupContinuationKind: Equatable, CustomStringConvertible {
+        case none
+        case leaveGrace
+        case continuedProcessing
+
+        var description: String {
+            switch self {
+            case .none: return "none"
+            case .leaveGrace: return "leave-grace"
+            case .continuedProcessing: return "continued-processing"
+            }
+        }
+    }
+
+    /// The drain loop may keep going while leftover time or a continued
+    /// processing task is still ours, even if the scene is no longer active.
+    private var mayKeepDraining: Bool {
+        isForeground || leaveGraceActive || continuedProcessingActive
+    }
     /// The scheduling outcome last written to the event log. `updateSchedule`
     /// runs on every background transition, and logging each resubmission would
     /// push the entries a report needs out of the timeline.
@@ -106,6 +138,28 @@ final class AutomaticBackupCoordinator: ObservableObject {
                 level: .error
             )
         }
+
+        if #available(iOS 26.0, *) {
+            continuedRegistered = BGTaskScheduler.shared.register(
+                forTaskWithIdentifier: Self.continuedTaskIdentifier,
+                using: nil
+            ) { [weak self] task in
+                guard let task = task as? BGContinuedProcessingTask else {
+                    task.setTaskCompleted(success: false)
+                    return
+                }
+                let window = BackgroundWindow()
+                task.expirationHandler = { window.expire() }
+                Task { @MainActor [weak self] in self?.beginContinued(task, window: window) }
+            }
+            if !continuedRegistered {
+                DiagnosticEventLog.shared.record(
+                    "scheduler",
+                    "Could not register continued processing, so Back Up Now cannot keep running after you leave on this build",
+                    level: .warning
+                )
+            }
+        }
     }
 
     func start() async {
@@ -144,25 +198,28 @@ final class AutomaticBackupCoordinator: ObservableObject {
     }
 
     func applicationDidEnterBackground() {
-        cancelForegroundScan()
-        // Anything still exporting is about to be frozen, not crashed.
-        queue.setPreparationGuardArmed(false)
-        queue.flushPendingWrites()
+        shouldRunAfterActivation = true
         isForeground = false
         queue.setICloudDownloadsAllowed(false)
-        shouldRunAfterActivation = true
         updateSchedule()
-        let transferring = queue.runningBackgroundTransferCount
-        DiagnosticEventLog.shared.record(
-            "lifecycle",
-            "Left the app with \(queue.activeCount) unfinished, \(transferring) transferring in iOS"
-                + (queue.activeCount > transferring ? "; the rest waits for a background window or the next launch" : "")
-        )
-        DiagnosticEventLog.shared.flush()
+        if continuedProcessingActive {
+            continuationKind = .continuedProcessing
+            queue.setHandoffPriority(true)
+            DiagnosticEventLog.shared.record(
+                "lifecycle",
+                "Left the app with \(queue.activeCount) unfinished; continued processing is keeping the backup running"
+            )
+            DiagnosticEventLog.shared.flush()
+            return
+        }
+        startLeaveGrace()
     }
 
     func applicationDidBecomeActive() {
+        abandonLeaveGraceBecauseAppIsOpen()
         isForeground = true
+        continuationKind = continuedProcessingActive ? .continuedProcessing : .none
+        queue.setHandoffPriority(continuedProcessingActive)
         queue.setPreparationGuardArmed(true)
         queue.setICloudDownloadsAllowed(true)
         queue.resumeSystemWork()
@@ -175,6 +232,218 @@ final class AutomaticBackupCoordinator: ObservableObject {
             "Opened the app; \(queue.activeCount) unfinished, \(queue.failedCount) failed"
         )
         runForegroundBackupIfNeeded()
+    }
+
+    private func startLeaveGrace() {
+        abandonLeaveGraceBecauseAppIsOpen()
+        leaveGraceActive = true
+        continuationKind = .leaveGrace
+        queue.setHandoffPriority(true)
+        queue.setPreparationGuardArmed(true)
+        queue.flushPendingWrites()
+
+        leaveGraceTaskID = UIApplication.shared.beginBackgroundTask(withName: Self.leaveGraceTaskName) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.expireLeaveGrace()
+            }
+        }
+        if leaveGraceTaskID == .invalid {
+            expireLeaveGrace()
+            return
+        }
+
+        let remaining = UIApplication.shared.backgroundTimeRemaining
+        let remainingText = remaining.isFinite && remaining < 60 * 60
+            ? "about \(Int(max(0, remaining).rounded())) s remaining"
+            : "a short time remaining"
+        DiagnosticEventLog.shared.record(
+            "lifecycle",
+            "Left the app with \(queue.activeCount) unfinished, \(queue.runningBackgroundTransferCount) transferring in iOS; using leftover time to keep preparing (\(remainingText))"
+        )
+
+        leaveGraceMonitor = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                guard let self, self.leaveGraceActive else { return }
+                if !self.queue.needsAppExecution {
+                    self.finishLeaveGraceAfterHandoff()
+                    return
+                }
+            }
+        }
+    }
+
+    private func expireLeaveGrace() {
+        if continuedProcessingActive {
+            abandonLeaveGraceBecauseAppIsOpen()
+            continuationKind = .continuedProcessing
+            return
+        }
+        guard leaveGraceActive || leaveGraceTaskID != .invalid else { return }
+        leaveGraceMonitor?.cancel()
+        leaveGraceMonitor = nil
+        leaveGraceActive = false
+        continuationKind = .none
+        queue.setHandoffPriority(false)
+        cancelForegroundScan()
+        isForeground = false
+        queue.suspendForBackgroundExpiration()
+        let transferring = queue.runningBackgroundTransferCount
+        let waiting = queue.waitingForExecutionCount
+        DiagnosticEventLog.shared.record(
+            "lifecycle",
+            "Leave-grace ended; \(transferring) transferring in iOS, \(waiting) waiting for another execution window",
+            level: waiting > 0 ? .warning : .info
+        )
+        DiagnosticEventLog.shared.flush()
+        endLeaveGraceTask()
+    }
+
+    /// Everything that still needs this process has been handed to iOS or is
+    /// waiting on iCloud. End the leftover-time task without cancelling PUTs.
+    private func finishLeaveGraceAfterHandoff() {
+        guard leaveGraceActive else { return }
+        leaveGraceMonitor?.cancel()
+        leaveGraceMonitor = nil
+        leaveGraceActive = false
+        continuationKind = .none
+        queue.setHandoffPriority(false)
+        cancelForegroundScan()
+        isForeground = false
+        queue.setPreparationGuardArmed(false)
+        queue.flushPendingWrites()
+        DiagnosticEventLog.shared.record(
+            "lifecycle",
+            "Handed remaining uploads to iOS; \(queue.runningBackgroundTransferCount) transferring, \(queue.waitingForExecutionCount) waiting"
+        )
+        DiagnosticEventLog.shared.flush()
+        endLeaveGraceTask()
+    }
+
+    private func abandonLeaveGraceBecauseAppIsOpen() {
+        leaveGraceMonitor?.cancel()
+        leaveGraceMonitor = nil
+        leaveGraceActive = false
+        endLeaveGraceTask()
+    }
+
+    private func endLeaveGraceTask() {
+        guard leaveGraceTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(leaveGraceTaskID)
+        leaveGraceTaskID = .invalid
+    }
+
+    @available(iOS 26.0, *)
+    @discardableResult
+    private func requestContinuedProcessing(_ sources: [MediaSource], source: AutomaticBackupRunSource) -> Bool {
+        guard continuedRegistered else { return false }
+        pendingContinuedSources = sources
+        pendingContinuedRunSource = source
+        let remaining = queue.activeCount
+        let request = BGContinuedProcessingTaskRequest(
+            identifier: Self.continuedTaskIdentifier,
+            title: "Backing Up Photos",
+            subtitle: remaining == 1 ? "1 item remaining" : "\(remaining) items remaining"
+        )
+        do {
+            try BGTaskScheduler.shared.submit(request)
+            DiagnosticEventLog.shared.record(
+                "scheduler",
+                "Requested continued processing so this backup can keep running after you leave the app"
+            )
+            return true
+        } catch {
+            pendingContinuedSources = nil
+            pendingContinuedRunSource = nil
+            DiagnosticEventLog.shared.record(
+                "scheduler",
+                "Could not start continued processing: \(Self.explainSchedulingError(error)); the backup stays in the app",
+                level: .warning
+            )
+            return false
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private func beginContinued(_ task: BGContinuedProcessingTask, window: BackgroundWindow) {
+        abandonLeaveGraceBecauseAppIsOpen()
+        continuedProcessingActive = true
+        continuationKind = .continuedProcessing
+        queue.setHandoffPriority(true)
+        queue.setPreparationGuardArmed(true)
+        queue.resumeSystemWork()
+        AppSessionTracker.note(isForeground ? .active : .backgroundWork)
+        let sources = pendingContinuedSources ?? []
+        let source = pendingContinuedRunSource ?? .manual
+        pendingContinuedSources = nil
+        pendingContinuedRunSource = nil
+        let completedBefore = queue.completedSourceCount
+        let run = AutomaticBackupRunHistory.started(source, context: executionContext())
+        reportContinuedProgress(task, completedBefore: completedBefore)
+
+        let operation = Task { @MainActor [weak self, weak task] in
+            guard let self else {
+                task?.setTaskCompleted(success: false)
+                return
+            }
+            await self.performForegroundBackup(sources, manual: true)
+            // The tap already queued the selection, so the scan loop above
+            // often has nothing new to accept. Stay in the continued-processing
+            // window until the queue actually settles or iOS expires it.
+            if !Task.isCancelled { _ = await self.queue.waitUntilSettled() }
+            self.continuedProcessingActive = false
+            if !self.leaveGraceActive { self.continuationKind = .none }
+            self.queue.setHandoffPriority(self.leaveGraceActive)
+            AutomaticBackupRunHistory.finished(
+                run,
+                success: !Task.isCancelled && self.queue.haltReason == nil,
+                summary: self.queue.continuationSummary
+                    ?? "backed up \(max(0, self.queue.completedSourceCount - completedBefore)); \(self.queue.activeCount) unfinished"
+            )
+            self.reportContinuedProgress(task, completedBefore: completedBefore)
+            task?.expirationHandler = nil
+            task?.setTaskCompleted(success: self.queue.haltReason == nil)
+            DiagnosticEventLog.shared.flush()
+            self.continuedOperation = nil
+        }
+        continuedOperation = operation
+        let expire: @Sendable () -> Void = { [weak self] in
+            DiagnosticEventLog.shared.record(
+                "scheduler",
+                "iOS ended continued processing; unfinished work stays queued",
+                level: .warning
+            )
+            operation.cancel()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.continuedProcessingActive = false
+                self.continuationKind = .none
+                self.queue.setHandoffPriority(false)
+                self.queue.suspendForBackgroundExpiration()
+            }
+        }
+        task.expirationHandler = expire
+        window.adopt(expire)
+
+        Task { @MainActor [weak self, weak task] in
+            while let self, let task, self.continuedProcessingActive, !Task.isCancelled {
+                self.reportContinuedProgress(task, completedBefore: completedBefore)
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private func reportContinuedProgress(_ task: BGContinuedProcessingTask?, completedBefore: Int) {
+        guard let task else { return }
+        let finished = max(0, queue.completedSourceCount - completedBefore)
+        let remaining = queue.activeCount
+        let total = max(Int64(finished + remaining), 1)
+        task.progress.totalUnitCount = total
+        task.progress.completedUnitCount = Int64(finished)
+        let subtitle = queue.continuationSummary
+            ?? (remaining == 0 ? "Finishing" : remaining == 1 ? "1 item remaining" : "\(remaining) items remaining")
+        task.updateTitle("Backing Up Photos", subtitle: subtitle)
     }
 
     func applyNetworkPolicy() {
@@ -229,6 +498,8 @@ final class AutomaticBackupCoordinator: ObservableObject {
             return "iOS already holds too many pending requests from this app"
         case .notPermitted:
             return "this build does not declare the task identifier in its Info.plist"
+        case .immediateRunIneligible:
+            return "iOS could not start continued processing right now"
         @unknown default:
             return error.localizedDescription
         }
@@ -282,6 +553,9 @@ final class AutomaticBackupCoordinator: ObservableObject {
     private func runForegroundBackupIfNeeded() {
         guard isForeground,
               !ranForegroundBackup,
+              !continuedProcessingActive,
+              foregroundOperation == nil,
+              backgroundOperation == nil,
               shouldSchedule,
               !queue.isUserPaused,
               account.status.isUsable,
@@ -341,7 +615,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         // Same reasoning as the background window: earlier transport failures
         // are invisible to the scan and nothing else releases them.
         queue.retryRetryableFailures()
-        while isForeground, !Task.isCancelled, account.status.isUsable,
+        while mayKeepDraining, !Task.isCancelled, account.status.isUsable,
               manual || shouldSchedule, !isPausedForAnyReason {
             let accepted = queue.enqueue(sources, skippingExisting: true)
             if accepted.isEmpty { return }
@@ -352,7 +626,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
                 // A pause the queue is honouring must end the loop too,
                 // otherwise this polls every 200 ms for as long as the user
                 // waits for Wi-Fi or leaves the backup paused.
-                if Task.isCancelled || !isForeground || !account.status.isUsable
+                if Task.isCancelled || !mayKeepDraining || !account.status.isUsable
                     || !(manual || shouldSchedule)
                     || queue.haltReason != nil || isPausedForAnyReason { return }
                 try? await Task.sleep(nanoseconds: 200_000_000)
@@ -390,7 +664,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let accepted = queue.enqueue(sources, skippingExisting: true)
         let total = accepted.count + released
         guard total > 0 else { return noteManual(.manual, .nothingToDo) }
-        startForegroundRun(sources, source: .manual)
+        startUserStartedRun(sources, source: .manual)
         return .started(count: total)
     }
 
@@ -411,7 +685,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let result = queue.reverify(sources)
         let total = result.enqueued + released
         guard total > 0 else { return noteManual(.recheck, .nothingToDo) }
-        startForegroundRun(sources, source: .recheck)
+        startUserStartedRun(sources, source: .recheck)
         return .rechecking(count: total)
     }
 
@@ -430,6 +704,17 @@ final class AutomaticBackupCoordinator: ObservableObject {
             level: outcome == .nothingToDo ? .info : .warning
         )
         return outcome
+    }
+
+    /// Take over the drain loop for a tap. On iOS 26 this also asks the system
+    /// to keep the run going after the user leaves, with a Live Activity.
+    private func startUserStartedRun(_ sources: [MediaSource], source: AutomaticBackupRunSource) {
+        cancelForegroundScan()
+        ranForegroundBackup = true
+        if #available(iOS 26.0, *), requestContinuedProcessing(sources, source: source) {
+            return
+        }
+        startForegroundRun(sources, source: source)
     }
 
     /// Take over the foreground loop for a manually started run, so the queue
@@ -459,6 +744,7 @@ final class AutomaticBackupCoordinator: ObservableObject {
     }
 
     private func begin(_ task: BGProcessingTask, window: BackgroundWindow) {
+        abandonLeaveGraceBecauseAppIsOpen()
         Self.logger.info("Beginning an iOS background-processing window")
         let submitted = UserDefaults.standard.double(forKey: Self.lastRequestSubmittedKey)
         let waited = submitted > 0
@@ -697,9 +983,17 @@ final class AutomaticBackupCoordinator: ObservableObject {
         }
         let summaries = requests.map { request in
             let processing = request as? BGProcessingTaskRequest
+            let kind: String
+            if processing != nil {
+                kind = "processing"
+            } else if #available(iOS 26.0, *), request is BGContinuedProcessingTaskRequest {
+                kind = "continued-processing"
+            } else {
+                kind = "app-refresh"
+            }
             return AutomaticBackupDiagnosticSnapshot.Request(
                 identifier: request.identifier,
-                kind: processing == nil ? "app-refresh" : "processing",
+                kind: kind,
                 earliestBeginDate: request.earliestBeginDate,
                 requiresNetwork: processing?.requiresNetworkConnectivity,
                 requiresPower: processing?.requiresExternalPower
@@ -708,9 +1002,13 @@ final class AutomaticBackupCoordinator: ObservableObject {
         let submitted = UserDefaults.standard.double(forKey: Self.lastRequestSubmittedKey)
         return AutomaticBackupDiagnosticSnapshot(
             handlerRegistered: registered,
+            continuedHandlerRegistered: continuedRegistered,
             appConsideredForeground: isForeground,
             foregroundOperationActive: foregroundOperation != nil,
             backgroundOperationActive: backgroundOperation != nil,
+            leaveGraceActive: leaveGraceActive,
+            continuedProcessingActive: continuedProcessingActive,
+            continuationKind: continuationKind.description,
             scheduleBlocker: scheduleBlocker,
             networkStatus: network.status.diagnosticLabel,
             pendingRequests: summaries,

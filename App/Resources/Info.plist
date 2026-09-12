@@ -5,6 +5,7 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.g8row.photosbackup.background-backup</string>
+		<string>com.g8row.photosbackup.continue-backup</string>
 	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>

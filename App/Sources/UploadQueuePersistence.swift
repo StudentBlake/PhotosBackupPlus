@@ -57,6 +57,11 @@ struct UploadCheckpoint: Codable, Equatable, Sendable {
         continuesAfterProcessExit == true
             && (prepared != nil || companionPrepared != nil)
     }
+    /// A PUT already came back with a receipt; the next step is a commit RPC
+    /// and that still needs an app execution window.
+    var hasPendingCommit: Bool {
+        prepared?.receipt != nil || companionPrepared?.receipt != nil
+    }
     var isLivePhoto: Bool { companionFilePath != nil || liveKind != nil }
 }
 

@@ -25,9 +25,13 @@ struct AutomaticBackupDiagnosticSnapshot: Sendable {
     }
 
     let handlerRegistered: Bool
+    let continuedHandlerRegistered: Bool
     let appConsideredForeground: Bool
     let foregroundOperationActive: Bool
     let backgroundOperationActive: Bool
+    let leaveGraceActive: Bool
+    let continuedProcessingActive: Bool
+    let continuationKind: String
     let scheduleBlocker: String?
     let networkStatus: String
     let pendingRequests: [Request]
@@ -130,9 +134,13 @@ enum DiagnosticReportBuilder {
 
         section("Scheduler")
         field("Handler registered", scheduler.handlerRegistered)
+        field("Continued-processing handler registered", scheduler.continuedHandlerRegistered)
         field("Coordinator foreground", scheduler.appConsideredForeground)
         field("Foreground operation active", scheduler.foregroundOperationActive)
         field("Background operation active", scheduler.backgroundOperationActive)
+        field("Leave-grace active", scheduler.leaveGraceActive)
+        field("Continued processing active", scheduler.continuedProcessingActive)
+        field("Continuation kind", scheduler.continuationKind)
         field("Schedule blocker", redacted(scheduler.scheduleBlocker))
         field("Last request submitted", scheduler.lastRequestSubmittedAt.map { "\(formatter.string(from: $0)) (\(ago($0)))" })
         field("Pending request count", scheduler.pendingRequests.count)
@@ -181,6 +189,8 @@ enum DiagnosticReportBuilder {
         field("Maximum concurrency", queue.maxConcurrent)
         field("Running now", queue.runningCount)
         field("Running in iOS background transfers", queue.runningBackgroundTransferCount)
+        field("Waiting for an execution window", queue.waitingForExecutionCount)
+        field("Continuation", redacted(queue.continuationSummary))
         field("Maximum attempts", queue.maxAttempts)
         field("User paused", queue.isUserPaused)
         field("Pause reason", redacted(queue.pauseReason))
