@@ -20,6 +20,7 @@ No backend. Swift 5.9, iOS 16.0+, XcodeGen-generated Xcode project.
 | `.agents/guardrails.md` | What NOT to do (security, signing, background limits) |
 | `docs/ADR-001-auth-route.md` | Auth design rationale + SideStore tradeoffs |
 | `docs/feasibility-probe.md` | Protocol details |
+| `docs/versioning.md` | Fork versioning: `{upstream}.{forkPatch}`; reset last segment on upstream bump |
 
 ## App identity (don't change casually)
 

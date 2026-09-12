@@ -9,8 +9,9 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "0.3.6"
-    CURRENT_PROJECT_VERSION: "14"
+    # Four-segment fork version: {upstream}.{forkPatch}. See docs/versioning.md.
+    MARKETING_VERSION: "0.3.6.1"
+    CURRENT_PROJECT_VERSION: "15"
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1"
     IPHONEOS_DEPLOYMENT_TARGET: "15.0"
