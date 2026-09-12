@@ -21,6 +21,7 @@ No backend. Swift 5.9, iOS 16.0+, XcodeGen-generated Xcode project.
 | `docs/ADR-001-auth-route.md` | Auth design rationale + SideStore tradeoffs |
 | `docs/feasibility-probe.md` | Protocol details |
 | `docs/versioning.md` | Fork versioning: `{upstream}.{forkPatch}`; reset last segment on upstream bump |
+| `CHANGELOG.md` | Fork-only changes; do not copy upstream notes |
 
 ## App identity (don't change casually)
 

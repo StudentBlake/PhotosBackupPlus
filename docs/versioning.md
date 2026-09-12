@@ -21,6 +21,7 @@ The first three segments always match the upstream marketing version this tree i
 1. Edit `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in [`project.yml`](../project.yml). That file is the source of truth.
 2. Run `xcodegen generate` so the generated Xcode project picks up the new values.
 3. Keep the README “Latest release” line in sync with `MARKETING_VERSION`, and note the upstream base when it differs.
+4. Add a `[x.y.z.n]` section to [`CHANGELOG.md`](../CHANGELOG.md). Record only this fork’s changes. After pulling a new upstream base, add one line that names that upstream version — do not copy upstream’s notes.
 
 Do not copy upstream’s three-segment `x.y.z` into this fork’s marketing version.
 

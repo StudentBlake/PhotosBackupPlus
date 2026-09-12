@@ -40,6 +40,10 @@ without a desktop companion or hosted service.
 - Expose a **Back Up Photos** Shortcuts action on iOS 16+ for charger,
   time-of-day, Wi-Fi, and other personal automations. It runs even with
   Automatic Backup off, so a schedule of your choosing can replace it.
+- Keep an in-progress backup moving after you lock the phone or switch apps:
+  leftover iOS time is used to finish preparing items and hand more file PUTs
+  to the background session. On iOS 26, **Back Up Now** and **Re-check Backups**
+  can keep running for minutes with a system progress indicator.
 - Keep file PUTs running in an iOS-owned background `URLSession`, then commit
   completed receipts when iOS relaunches the app.
 - Track PhotoKit persistent changes on iOS 16+ so backdated imports are found.
@@ -61,8 +65,8 @@ Photos credential, and an authenticated `photosdata-pa` request succeeds.
 The Xcode project, app target, and scheme are named `PhotosBackup`; the
 user-facing app is named **Photos Backup**.
 
-Latest release: **0.3.6.1** (this fork; based on upstream **0.3.6**, [releases](https://github.com/g8row/PhotosBackup/releases)). Version numbering for this fork is documented in [docs/versioning.md](docs/versioning.md).
-177 tests run on an iPhone simulator: 174 pass. The 2 opt-in live tests and
+Latest release: **0.3.6.2** (this fork; based on upstream **0.3.6**, [releases](https://github.com/g8row/PhotosBackup/releases)). Version numbering for this fork is documented in [docs/versioning.md](docs/versioning.md). Fork-only changes are listed in [CHANGELOG.md](CHANGELOG.md).
+181 tests run on an iPhone simulator: 178 pass. The 2 opt-in live tests and
 the Keychain round trip, which needs a signed build, are skipped.
 
 ### App identity (since 0.0.2)
@@ -71,6 +75,7 @@ the Keychain round trip, which needs a signed build, are skipped.
 | --- | --- |
 | App bundle ID | `com.g8row.photosbackup` |
 | Background task | `com.g8row.photosbackup.background-backup` |
+| Continued processing (iOS 26+) | `com.g8row.photosbackup.continue-backup` |
 | Background upload session | `com.g8row.photosbackup.background-upload` |
 
 > [!IMPORTANT]
@@ -253,8 +258,13 @@ Android master token → Photos access token → private Photos API
   advances once a scan's sources have all been handed to the queue, so a
   saturated queue stops re-enumerating the library on every window.
 - Export, hashing, duplicate lookup, and upload initialization still need an
-  execution window. Once initialized, the file PUT continues under iOS even if
-  the processing window expires; the app persists the receipt before commit.
+  execution window. Leaving the app uses leftover iOS time (about 30 seconds)
+  to keep preparing and to hand more files to iOS; after that, only submitted
+  file PUTs continue. On iOS 26, a user-started **Back Up Now** can keep
+  preparing for minutes with a system progress indicator. Force-quit still
+  cancels background transfers. Once initialized, the file PUT continues under
+  iOS even if the processing window expires; the app persists the receipt
+  before commit.
 - Cloud-only PhotoKit resources are deferred during short background processing
   windows and resume with network access when the app is foregrounded.
 - Unsigned simulator builds cannot persist the credential in the Keychain.
