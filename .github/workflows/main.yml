@@ -1,0 +1,100 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    env:
+      CONFIG: Release
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Generate Xcode project
+        run: |
+          set -euo pipefail
+          if [ -f project.yml ]; then
+            brew install xcodegen
+            xcodegen generate
+          fi
+
+      - name: Discover project, workspace, and scheme
+        id: discover
+        run: |
+          set -euo pipefail
+          if ls *.xcworkspace >/dev/null 2>&1; then
+            WORKSPACE=$(ls -d *.xcworkspace | head -n1)
+            echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+            LIST_ARGS="-workspace $WORKSPACE"
+          elif ls *.xcodeproj >/dev/null 2>&1; then
+            PROJECT=$(ls -d *.xcodeproj | head -n1)
+            echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+            LIST_ARGS="-project $PROJECT"
+          else
+            echo "::error::No .xcodeproj or .xcworkspace found"
+            exit 1
+          fi
+
+          SCHEME=$(xcodebuild -list $LIST_ARGS -json | jq -r 'if has("workspace") then .workspace.schemes[0] else .project.schemes[0] end')
+          if [ -z "$SCHEME" ] || [ "$SCHEME" = "null" ]; then
+            echo "::error::No scheme found via xcodebuild -list"
+            exit 1
+          fi
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned .app
+        run: |
+          set -euo pipefail
+          BUILD_DIR="$(mktemp -d)"
+          echo "BUILD_DIR=$BUILD_DIR" >> "$GITHUB_ENV"
+
+          SDK_NAME=$(xcodebuild -showsdks | grep -o 'iphoneos27\.[0-9]*' | head -n1)
+          if [ -z "$SDK_NAME" ]; then
+            SDK_NAME=$(xcodebuild -showsdks | grep -o 'iphoneos[0-9.]*' | tail -n1)
+          fi
+
+          if [ -n "${{ steps.discover.outputs.workspace }}" ]; then
+            PROJ_ARGS="-workspace ${{ steps.discover.outputs.workspace }}"
+          else
+            PROJ_ARGS="-project ${{ steps.discover.outputs.project }}"
+          fi
+
+          xcodebuild $PROJ_ARGS \
+            -scheme "${{ steps.discover.outputs.scheme }}" \
+            -sdk "$SDK_NAME" -configuration "$CONFIG" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -derivedDataPath "$BUILD_DIR" build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP=$(find "$BUILD_DIR/Build/Products/$CONFIG-iphoneos" -maxdepth 1 -name "*.app" | head -n1)
+          [ -d "$APP" ] || { echo "::error::No .app found under $BUILD_DIR/Build/Products/$CONFIG-iphoneos"; exit 1; }
+
+          APP_NAME=$(basename "$APP" .app)
+          VERSION=$(plutil -extract CFBundleShortVersionString raw "$APP/Info.plist" 2>/dev/null || echo "0.0")
+          BUILD_NUM=$(plutil -extract CFBundleVersion raw "$APP/Info.plist" 2>/dev/null || echo "0")
+          IPA_BASENAME="${APP_NAME}-${VERSION}-${BUILD_NUM}-unsigned"
+
+          STAGE="$BUILD_DIR/stage"
+          mkdir -p "$STAGE/Payload" output
+          cp -R "$APP" "$STAGE/Payload/"
+          ( cd "$STAGE" && zip -qry "$GITHUB_WORKSPACE/output/${IPA_BASENAME}.ipa" Payload )
+
+          echo "IPA_BASENAME=$IPA_BASENAME" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_BASENAME }}
+          path: output/*.ipa
+          retention-days: 14
+          if-no-files-found: error
